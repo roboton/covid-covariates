@@ -1,0 +1,992 @@
+---
+title: "Assessing predictive power of surveys and covariates"
+author: "Robert On, Hal Varian"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+    toc_depth: 5
+    code_folding: show
+---
+
+The purpose of this notebook is to assess the predictive power of online surveys made available by [CMU Delphi](https://cmu-delphi.github.io/delphi-epidata/api/) and county-level covariates from [County Health Rankings](https://www.countyhealthrankings.org/) towards estimating COVID-19 outcomes.
+
+There are three sections:
+1. Producing an analysis ready data set that includes COVID-19 relevant outcomes and the aforementioned predictors.
+2. Producing some basic descriptive statistics of the covariate data.
+3. Assessing the predictive power of these data.
+
+The goal is to provide these data for future analysis and demonstrate its future predictive or analytical value.
+
+```{r message=FALSE, warning=FALSE}
+library(BoomSpikeSlab)
+library(tidyverse)
+library(lubridate)
+library(jsonlite)
+library(rvest)
+library(plotly)
+library(glmnetUtils)
+source("https://raw.githubusercontent.com/cmu-delphi/delphi-epidata/master/src/client/delphi_epidata.R")
+```
+
+# Assembling the data
+
+Below we explore the available data sources, write scripts to fetch them from their sources, and then clean-up and join to produce a county x day analysis ready data set.
+
+## COVIDcast 
+
+### CMU Delphi Epidata
+
+The *required* parameter for the API is the `source``, we'll scrape that from their [documentation](https://cmu-delphi.github.io/delphi-epidata/api/).
+
+```{r}
+(source_list <- read_html("https://cmu-delphi.github.io/delphi-epidata/api/") %>%
+   html_nodes("table") %>%
+   map_df(html_table))
+```
+
+
+CMU Delphi has produced a number of survey-based measures that are meant to predict the severity of COVID-19 infections around the US.
+
+A more thorough description of the data and its parameters can be found [here](https://cmu-delphi.github.io/delphi-epidata/api/`r source$Source`.html).
+
+```{r}
+source <- source_list %>% slice(1)
+read_html(str_glue("https://cmu-delphi.github.io/delphi-epidata/api/{source$Source}.html")) %>%
+  html_nodes("table") %>%
+  map_df(html_table) %>%
+  select(Parameter, Field, everything())
+```
+
+The parameters are arguments that can be passed to the API while fields are values in the response returned from the API.
+
+### Generating parameter values
+
+Scrape the CMU Delphi documentation for valid parameter values.
+
+```{r}
+# time values
+start_date <- ymd("20200406")
+end_date <- today()
+time_values <- seq(start_date, end_date, by = "day") %>%
+  format("%Y%m%d")
+time_types <- c("day")
+
+(param_vals <- read_html(str_glue("https://cmu-delphi.github.io/delphi-epidata/api/{source$Source}.html")) %>%
+   html_nodes("table") %>% .[[1]] %>%
+   html_nodes("tr") %>% .[c(-3, -6)] %>%
+   map_df(function(x) {
+     tibble(
+       param = x %>% html_nodes("td") %>% .[1] %>% html_text(),
+       param_value = x %>% html_nodes("td") %>% .[2] %>%
+         html_nodes("code") %>% html_text())
+   }) %>%
+   bind_rows(tibble(
+     param = "time_values",
+     param_value = time_values
+   )))
+
+(source_signals <- read_html(str_glue("https://cmu-delphi.github.io/delphi-epidata/api/{source$Source}.html")) %>%
+  # second unordered list
+  html_nodes("ul")  %>% .[[2]] %>%
+  # get the list items
+  html_nodes("li") %>%
+  # for each list item
+  map_df(function(x) {
+    tibble(
+      # get first element (data_source)
+      data_source= x %>% html_nodes("code") %>% .[[1]] %>% html_text(),
+      # get the rest of the elements, skipping second element
+      signal = x %>% html_nodes("code") %>% html_text() %>% tail(-2))
+  }) %>%
+  filter(!str_detect(signal , "\\*")) %>%
+  bind_rows(., (.) %>%
+              filter(data_source == "fb-survey" &
+                       str_starts(signal, "raw_")) %>%
+              mutate(signal = str_replace(signal, "raw_", "smoothed_"))) %>%
+  unique())
+```
+
+We enumerate the valid parameter values and the `signal` values that are conditional on the `data_source` parameter. The only parameter value that is not being utilized here is `time_type = week` since we'll be focusing on daily data. 
+
+### Fetch data
+
+Then generate a data frame of parameter values where each row will contain parameter values to be passed to the API to fetch data.
+
+```{r}
+(fetch_args <- param_vals %>% 
+   filter(param != "geo_value" | param_value == "*") %>%
+   chop(c(param_value)) %>%
+   spread(param, param_value) %>%
+   unnest(data_source) %>%
+   unnest(geo_type) %>%
+   unnest(geo_value) %>%
+   unnest(time_type) %>%
+   unnest(time_values) %>%
+   left_join(source_signals, by = "data_source"))
+```
+
+Begin fetching data. It's worth noting here that the return values for different `data_source`s end up returning different data structures which makes it hard to uniformly collect this data and some complications in the parsing code.
+
+```{r}
+covcast_file <- "covcast_daily.csv"
+refresh <- FALSE
+
+fetch_delphi <- function(
+  source, data_source, signal, time_type, geo_type, time_values, geo_value) {
+  # print(paste(source, data_source, signal, time_type, geo_type, time_values,
+  #             geo_value))
+  res <- Epidata[[source]](data_source, signal, time_type, geo_type,
+                                  list(time_values), geo_value)
+  # result had an error
+  if(res$result != 1) {
+    warning(str_glue("Error fetching {data_source}, {signal}, {time_values}: ",
+                     "{res$message}"))
+    return(NA)
+  }
+  tmp <- res$epidata %>%
+    # There may be a better way to parse the list of lists
+    toJSON(auto_unbox = TRUE) %>% fromJSON()
+  # handle case where missing values returned as a data.frame with a NULL
+  if(class(tmp$stderr) == "data.frame" ||
+     class(tmp$sample_size) == "data.frame" ||
+     class(tmp$direction) == "data.frame") {
+    tmp$stderr <- NA_real_
+    tmp$sample_size <- NA_real_
+    tmp$direction <- NA_integer_
+    return(tmp)
+  }
+  return(tmp %>%
+    # handle case where missing values returned as an empty list       
+    mutate(
+      direction = map_int(direction, function(x) {
+        if (is.null(unlist(x))) return(NA_integer_) else return(unlist(x)) }),
+      stderr = map_dbl(stderr, function(x) {
+        if (is.null(unlist(x)) || class(unlist(x)) == "data.frame") 
+          return(NA_real_) else return(unlist(x)) }),
+      sample_size = map_dbl(sample_size, function(x) {
+        if (is.null(unlist(x)) || class(unlist(x)) == "data.frame") 
+          return(NA_real_) else return(unlist(x)) })))
+}
+
+if (refresh || !file.exists(covcast_file)) {
+  covcast_daily <- fetch_args %>%
+    # only fetch daily data
+    filter(time_type %in% time_types) %>%
+    mutate(res = pmap(., fetch_delphi, source = source$Source)) %>%
+    select(-geo_value, -time_values) %>%
+    unnest(res) %>%
+    mutate(date = ymd(time_value)) %>%
+    select(-res, -time_value)
+  write_csv(covcast_daily, covcast_file)
+} else {
+  covcast_daily <- read_csv(covcast_file, col_types = "cccccnnnnD")
+}
+
+covcast_daily %>% mutate_if(is.character, as.factor) %>% summary()
+```
+
+This produces a file `r covcast_file` which contains all the survey data from this API at a daily level at all the geo levels. By default, this code chunk will look for this file before fetching data from the API. If you wish to refresh `r covcast_file` set `refresh <- TRUE`.
+
+## JHU COVID-19 data
+
+```{r message = FALSE}
+jhu <- left_join(
+  read_csv("https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/time_series_covid19_deaths_US.csv") %>%
+    gather(date, deaths, matches("^[1-9]")) %>%
+    mutate(date = mdy(date)),
+  read_csv("https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/time_series_covid19_confirmed_US.csv") %>%
+    gather(date, cases, matches("^[1-9]")) %>%
+    mutate(date = mdy(date)))
+jhu %>% mutate_if(is.character, as.factor) %>% summary()
+```
+
+There is a `FIPS` and `Population` which will be useful for normalizing and joining with county level data from COVIDcast and county metrics.
+
+## County Health Rankings
+
+More information about each of these variales can be found [here](https://www.countyhealthrankings.org/explore-health-rankings/measures-data-sources/2020-measures).
+
+```{r}
+# county health info
+# health_info <- read_csv("health.csv") %>%
+#   mutate_at(vars(-state, -county), ~ as.numeric(.))(
+chr <- read_csv(
+  "https://www.countyhealthrankings.org/sites/default/files/media/document/analytic_data2020.csv") %>%
+  slice(-1) %>%
+  mutate_at(vars(-1:-5), as.numeric)
+
+chr %>% mutate_if(is.character, as.factor) %>% 
+  select(contains(" raw value")) %>%
+  select_if(~ runif(1) < 0.25) %>%
+  summary()
+```
+
+## Putting it all together
+
+```{r}
+covcast_join <- covcast_daily %>%
+  unite(source_signal, data_source, signal) %>%
+  filter(geo_type == "county") %>%
+  select(-time_type, -direction, -stderr, -sample_size, -geo_type) %>%
+  filter(!is.na(geo_value) & !is.na(date)) %>%
+  pivot_wider(names_from = source_signal, values_from = value) %>%
+  mutate_at(vars(geo_value), as.numeric) %>%
+  rename(FIPS = geo_value) %>%
+  rename_at(vars(-FIPS, -date), ~ paste0("cmu_", .x))
+
+chr_join <- chr %>%
+  rename(FIPS = `5-digit FIPS Code`) %>%
+  mutate_at(vars(FIPS), as.numeric) %>%
+  select(-`State FIPS Code`, -`County FIPS Code`, -`State Abbreviation`,
+         -Name, -`Release Year`, -`County Ranked (Yes=1/No=0)`) %>%
+  select_at(vars(FIPS, ends_with(" raw value"))) %>%
+  rename_all(~ str_remove(.x, " raw value")) %>%
+  rename_all(~ str_replace(.x, "^\\%", "pct.pop")) %>%
+  rename_at(vars(-FIPS), ~ paste0("chr_", .x))
+
+jhu_join <- jhu %>%
+  # counties
+  filter(code3 == 840) %>%
+  select(-UID, -iso2, -iso3, -code3, county = Admin2, state = Province_State,
+         -Country_Region, -Lat, -Long_, -Combined_Key) %>%
+  rename_at(vars(Population, deaths, cases), ~ paste0("jhu_", .x))
+
+# look at county level data joined with health info
+county_preds <- jhu_join %>%
+  left_join(covcast_join, by = c("date", "FIPS")) %>%
+  left_join(chr_join, by = c("FIPS")) %>%
+  select(FIPS, county, state, date, everything()) %>%
+  rename_all(str_to_lower) %>%
+  rename_all(vctrs::vec_as_names, repair = "universal", quiet = TRUE)
+
+write_csv(county_preds, "county_preds.csv")
+```
+
+# Descriptive stats
+
+## COVIDcast
+
+The main measure of interest is the `value_raw_cli` column which is the percentage of those surveyed who report on "Covid-like symptoms" in their community.
+
+Smoothed CLI vs Raw CLI:
+
+```{r fig.height=9}
+county_preds %>%
+  select(date, state, starts_with("cmu_")) %>%
+  filter_all(~ !is.na(.)) %>%
+  group_by(date) %>%
+  summarise_at(vars(-state), mean) %>%
+  gather(type, value, -date) %>%
+  ggplot(aes(date, value, lty = type)) +
+  geom_line() +
+  theme(legend.title = element_blank(), legend.position = "none") +
+  facet_wrap(vars(type), scales = "free_y", ncol = 3)
+```
+
+Clear that `smoothed_cli` is some kind of smoother over raw values over time. It was clarified by Natalia that this was to be treated like a percentage and not to be divided by sample size.
+
+Overall we also see a decline in reporting these symptoms which we're not sure if is because of an actual decline in symptoms or if it's some artifact of of the survey methodology.  As this information progresses we may be able to better correlate it to increases or decreases in case infection rates (or something better).
+
+We break this down by state, looking just at the smoothed values for the three states with the biggest and smallest change in infection rate.
+
+```{r fig.height=9, fig.width=9}
+county_preds %>%
+  select(date, state, starts_with("cmu_")) %>%
+  filter_all(~ !is.na(.)) %>%
+  group_by(date, state) %>%
+  summarise_all(mean) %>%
+  gather(type, value, -date, -state) %>%
+  filter(str_detect(type, "smoothed")) %>%
+  group_by(state, type) %>%
+  arrange(date) %>%
+  mutate(change = last(value) - first(value)) %>%
+  group_by(type) %>%
+  filter(dense_rank(change) <= 3 | dense_rank(desc(change)) <= 3) %>%
+  ggplot(aes(date, value, color = state)) +
+  geom_line() +
+  theme(legend.title = element_blank()) +
+  facet_wrap(vars(type), scales = "free_y", ncol = 2) -> p
+ggplotly(p)
+```
+
+The same thing by county:
+
+```{r fig.height=9, fig.width=9}
+county_preds %>%
+  mutate(county = paste(county, state, sep=", ")) %>%
+  select(date, county, starts_with("cmu_")) %>%
+  filter_all(~ !is.na(.)) %>%
+  group_by(date, county) %>%
+  summarise_all(mean) %>%
+  gather(type, value, -date, -county) %>%
+  filter(str_detect(type, "smoothed")) %>%
+  group_by(county, type) %>%
+  arrange(date) %>%
+  mutate(change = last(value) - first(value)) %>%
+  group_by(type) %>%
+  filter(dense_rank(change) <= 3 | dense_rank(desc(change)) <= 3) %>%
+  ggplot(aes(date, value, color = county)) +
+  geom_line() +
+  theme(legend.title = element_blank()) +
+  facet_wrap(vars(type), scales = "free_y", ncol = 2) -> p
+ggplotly(p)
+```
+
+What about a basic comparison of infection rates as estimated from Google surveys vs JHU? We don't expect this to be dead on because surveys should be a leading indicator for JHU cases but we don't have enough dates from the surveys to do that analysis yet.
+
+```{r fig.height=9, fig.width=9}
+county_preds %>%
+  filter(!is.na(cmu_google.survey_raw_cli)) %>%
+  group_by(state, county) %>%
+  summarise(
+    infection_rate_jhu = max(jhu_cases) / max(jhu_population),
+    infection_rate_goog = mean(cmu_google.survey_raw_cli)) %>%
+  ggplot(aes(infection_rate_jhu, infection_rate_goog, color = state,
+             label = county)) +
+  geom_abline(slope = 100) + geom_point() + ylim(0, 16) -> p
+ggplotly(p)
+```
+
+Google survey `raw_cli` rate is much higher than the infection rate as reported from JHU data.  This is expected because a) not all illnesses turn out to be Covid, and b) not all Covid-19 gets confirmed by a test.  This should be an upper bound for a true infection rate apart from selection bias in the Google Survey sample.
+
+This also points out a couple data anomolies with the counties in New York City reporting zero cases in the JHU data while reporting a very high infection rate in the Google surveys.  Furthermore, the other New York area counties show a stronger correlation between the surveys and the cases data which seems to reflect that more prevalent testing or a higher infection rate creates a stronger relationship between the infection rate from the surveys and the confirmed cases.
+
+## County Health Rankings
+
+There are over 100 features covered by the CHR data which isn't the easiest thign to summarise. Instead we can use this data to do some clustering based on counties that look similar. This can be useful later in determining which counties are more comparable than others and then looking at variation in policies that happened within the comparable counties.
+
+```{r}
+cnt_na_rows_cols <- function(thresh) {
+  county_preds %>%
+    mutate(county = paste(county, state, sep = ", ")) %>%
+    group_by(county) %>%
+    select(county, starts_with("chr_")) %>%
+    summarise_all(first) %>%
+    column_to_rownames("county") %>%
+    select_if(~ mean(!is.na(.x)) >= thresh) %>%
+    filter_all(all_vars(!is.na(.))) %>%
+    dim()
+}
+
+thresholds <- seq(0.04, 0.96, by = 0.01)
+do.call(rbind, lapply(thresholds, cnt_na_rows_cols)) %>%
+  as_tibble() %>%
+  select(rows = V1, cols = V2) %>%
+  mutate(threshold = !!thresholds) %>%
+  ggplot(aes(rows, cols, label = threshold)) +
+  geom_point() +
+  geom_smooth(se = FALSE) -> p
+ggplotly(p)
+```
+
+```{r eval=FALSE, fig.height=9, fig.width=9, include=FALSE}
+library(dendextend)
+county_preds %>%
+  mutate(county = paste(county, state, sep = ", ")) %>%
+  group_by(county) %>%
+  select(county, starts_with("chr_")) %>%
+  summarise_all(first) %>%
+  group_by(county) %>%
+  select_if(~ mean(!is.na(.x)) >= 0.95) %>%
+  filter_all(all_vars(!is.na(.))) %>%
+  column_to_rownames("county") -> df
+
+df %>% as.matrix() -> m
+
+m %>% dist() -> d
+
+hc <- d %>% hclust(method = "ward.D2")
+
+hc %>% as.dendrogram() %>% get_subdendrograms(12) %>% sapply(plot, horiz = TRUE)
+```
+
+## JHU vs CHR populations
+
+Everything lines up with the exception of New York County.  According to [this](https://www.census.gov/quickfacts/fact/table/newyorkcountymanhattanboroughnewyork,US/PST045219), the county health data is correct since New York County (FIPS: 36061) technically only contains Manhattan and not the other boroughs.
+
+```{r}
+county_preds %>%
+  group_by(state, county, fips) %>%
+  summarise(
+    jhu_population = first(jhu_population),
+    population = first(na.omit(chr_population))) %>%
+  ggplot(aes(population, jhu_population, label = paste(county, fips))) +
+  geom_point() +
+  geom_abline(slope = 1) -> p
+ggplotly(p)
+```
+
+
+## County population coverage
+
+```{r}
+county_preds %>%
+  group_by(state, county) %>%
+  summarise(missing_covcast = mean(all(is.na(cmu_google.survey_raw_cli))),
+            missing_health_info = mean(all(is.na(chr_population)))) %>%
+  group_by(state) %>%
+  summarise_all(mean) %>%
+  ggplot(aes(missing_covcast, missing_health_info, color = state)) +
+  geom_point(alpha = 0.8) +
+  ylim(0, 1) + xlim(0, 1) +
+  geom_abline(slope = 1, alpha = 0.2) +
+  theme(legend.title = element_blank()) -> p
+ggplotly(p)
+```
+
+This gives us a sense of how much coverage we have across counties in our county metric data set as well as the COVIDcast google surveys. We can see that many more counties are missing in the COVIDcast surveys while there are missing counties in small states like Delaware and Rhode Island - and places that are not really states like DC and the Diamond Princess.
+
+
+```{r fig.height = 12}
+county_preds %>%
+  #rbind((.) %>% mutate(state = "US")) %>%
+  group_by(state, county) %>%
+  summarise(
+    jhu_population = max(jhu_population),
+    pop_covcast = any(!is.na(cmu_google.survey_raw_cli)) * jhu_population,
+    pop_health_info = any(!is.na(chr_population)) * jhu_population) %>%
+  group_by(state) %>%
+  summarise(
+    jhu_population = sum(jhu_population),
+    pop_covcast = sum(pop_covcast),
+    pop_health_info = sum(pop_health_info)) %>%
+  arrange(desc(jhu_population)) %>%
+  mutate(state = fct_reorder(
+    state, desc((jhu_population - pop_covcast) / jhu_population))) %>%
+  gather(type, value, -state) %>%
+  ggplot(aes(state, value, fill = type)) +
+  geom_bar(stat = "identity", position = "dodge") + coord_flip() + 
+  theme(legend.title = element_blank()) -> p
+ggplotly(p)
+```
+
+The COVIDcast data is missing many more counties but from a population perspective, it isn't as big of a difference. Here are the populations covered by each data source ranked by the the amount of coverage that COVIDcast has as a percentage of population. It seems rural areas/states are the spottiest. CHR data is pretty complete.
+
+# Predictive power
+
+In an ideal world, we can include all predictors in our model and advances in learning algorithms have developed methods to address the issue of having too many in your model. Practically speaking, we often have costs associated with including a certain data set.  This could be the costs of processing it, collecting it, purchasing it, or the risks in making it available. We must weight this cost against the additional predictive power a data set provides us - and the implications of that additional predictive power on the different types of errors.
+
+Since we only have two days of infections survey data from COVIDcast, our time series predictors are limited.  Instead we will do prediction across counties and take mean values across the time varying measures from COVIDcast.  We're no longer examining information from changes over time in these measures but simply examining whether or not the variation in mean values across counties is meaningful.
+
+```{r}
+mean_dat <- county_preds %>%
+  filter(!is.na(cmu_google.survey_raw_cli)) %>%
+  group_by(fips, county, state) %>%
+  summarise_all(mean, na.rm = TRUE) %>%
+  mutate(jhu_infection_rate = jhu_cases / jhu_population,
+         jhu_fatality_rate = jhu_deaths / jhu_cases) %>%
+  ungroup() %>%
+  select_if(~ mean(!is.na(.x)) >= 0.95) %>%
+  select(-county, -state, -fips, -date, -starts_with("jhu_"),
+         ends_with("_rate"), -contains("_raw_"))
+```
+
+## Cases
+
+With our covariates joined to our outcomes we run some basic regressions to see how much predictive power these covariates have at the cross-section of counties.  We simply take the mean values of survey data and covid case/deaths data across the dates present to explain the variation in counties by this survey data and county-level covariates.
+
+### Basic OLS
+
+Start with basic OLS with everything in the RHS. It's generally not advised to include so many factors but we're starting here as a baseline.
+
+```{r}
+mean_dat %>%
+  select(-jhu_fatality_rate) %>%
+  lm(jhu_infection_rate ~ ., data = .) %>%
+  summary()
+```
+
+In the most simple specification we're explaining about 75% of the variation across counties. Given the number of variables included, this is likely an overesetimate.  Some intuitive coefficients demonstrate predictive power: A higher surveyed infection rate, an older population, higher income inequality, being uninsured and doctor visits. There are some less intuitive ones like driving alone to work, more minors. There is a lot of correlation between these predictors so we can't say much more.
+
+### Variable selection
+
+Having too many predictors is likely leading to overfitting, we can use some form of penalized variable selection to address this.  In this case we'll use spike-and-slab regression - the Bayesian counterpart to the LASSO.
+
+To understand the predictive value of different data sets, we run different spike-and-slab regressions using different subsets of the data.  One with CMU provided data, another from CHR, and finally one with all the predictors included. The latter should give us our best $r^2$ while the difference between this value and the full model will identify how much predictive value add that data set provides.
+
+```{r message=FALSE, warning=FALSE}
+lm.spike(jhu_infection_rate ~ .,
+         data = mean_dat %>%
+           select(jhu_infection_rate, contains("chr_")),
+         niter = 1e5) -> spike_mdl_chr
+
+lm.spike(jhu_infection_rate ~ .,
+         data = mean_dat %>%
+           select(jhu_infection_rate, contains("chr_"),
+                  contains("cmu_facebook")),
+         niter = 1e5) -> spike_mdl_facebook
+
+lm.spike(jhu_infection_rate ~ .,
+         data = mean_dat %>%
+           select(jhu_infection_rate, contains("chr_"),
+                  contains("cmu_google")),
+         niter = 1e5) -> spike_mdl_google
+
+lm.spike(jhu_infection_rate ~ .,
+         data = mean_dat %>%
+           select(jhu_infection_rate, contains("chr_"),
+                  contains("cmu_doctor")),
+         niter = 1e5) -> spike_mdl_doctor
+
+lm.spike(jhu_infection_rate ~ .,
+         data = mean_dat %>%
+           select(jhu_infection_rate, contains("chr_"),
+                  contains("cmu_")),
+         niter = 1e5) -> spike_mdl_cmu
+
+lm.spike(jhu_infection_rate ~ .,
+         data = mean_dat %>% select(-jhu_fatality_rate),
+         niter = 1e5) -> spike_mdl_all
+```
+
+```{r}
+summary(spike_mdl_chr)$rsquare
+summary(spike_mdl_facebook)$rsquare
+summary(spike_mdl_google)$rsquare
+summary(spike_mdl_doctor)$rsquare
+summary(spike_mdl_cmu)$rsquare
+summary(spike_mdl_all)$rsquare
+```
+
+Starting with the county covariates (CHR) data as a baseline, we add other data sets one at a time to understand its incremental predictiveness. Facebook surveys add virtually nothing, but the Google surveys and Doctor visits provide a large lift of around 20pp (~50%). At most we're explaning about 65% of the variation across all these predictors, largely driven by the Google and Doctor visits data sets.
+
+### Variable importance 
+
+```{r fig.height=12, fig.width=6}
+plot(spike_mdl_chr, "scaled.coefficients", cex.axis = 0.6)
+plot(spike_mdl_facebook, "scaled.coefficients", cex.axis = 0.6)
+plot(spike_mdl_google, "scaled.coefficients", cex.axis = 0.6)
+plot(spike_mdl_doctor, "scaled.coefficients", cex.axis = 0.6)
+plot(spike_mdl_cmu, "scaled.coefficients", cex.axis = 0.6)
+plot(spike_mdl_all, "scaled.coefficients", cex.axis = 0.6)
+```
+
+## Deaths
+
+Repeat the same with deaths.
+
+### Basic OLS
+
+Start with basic OLS with everything in the RHS. It's generally not advised to include so many factors but we're starting here as a baseline.
+
+```{r}
+mean_dat %>%
+  select(-jhu_infection_rate) %>%
+  lm(jhu_fatality_rate ~ ., data = .) %>%
+  summary()
+```
+
+In the most simple specification we're explaining about 29% of the variation across counties. Given the number of variables included, this is likely an overesetimate.  Nothing stands out as especially predictive, apart from the Google surveys.
+
+### Variable selection
+
+Having too many predictors is likely leading to overfitting, we can use some form of penalized variable selection to address this.  In this case we'll use spike-and-slab regression - the Bayesian counterpart to the LASSO.
+
+To understand the predictive value of different data sets, we run different spike-and-slab regressions using different subsets of the data.  One with CMU provided data, another from CHR, and finally one with all the predictors included. The latter should give us our best $r^2$ while the difference between this value and the full model will identify how much predictive value add that data set provides.
+
+```{r message=FALSE, warning=FALSE}
+lm.spike(jhu_fatality_rate ~ .,
+         data = mean_dat %>%
+           select(jhu_fatality_rate, contains("chr_")),
+         niter = 1e5) -> spike_mdl_chr
+
+lm.spike(jhu_fatality_rate ~ .,
+         data = mean_dat %>%
+           select(jhu_fatality_rate, contains("chr_"),
+                  contains("cmu_facebook")),
+         niter = 1e5) -> spike_mdl_facebook
+
+lm.spike(jhu_fatality_rate ~ .,
+         data = mean_dat %>%
+           select(jhu_fatality_rate, contains("chr_"),
+                  contains("cmu_google")),
+         niter = 1e5) -> spike_mdl_google
+
+lm.spike(jhu_fatality_rate ~ .,
+         data = mean_dat %>%
+           select(jhu_fatality_rate, contains("chr_"),
+                  contains("cmu_doctor")),
+         niter = 1e5) -> spike_mdl_doctor
+
+lm.spike(jhu_fatality_rate ~ .,
+         data = mean_dat %>%
+           select(jhu_fatality_rate, contains("chr_"),
+                  contains("cmu_")),
+         niter = 1e5) -> spike_mdl_cmu
+
+lm.spike(jhu_fatality_rate ~ .,
+         data = mean_dat %>% select(-jhu_infection_rate),
+         niter = 1e5) -> spike_mdl_all
+```
+
+```{r}
+summary(spike_mdl_chr)$rsquare
+summary(spike_mdl_facebook)$rsquare
+summary(spike_mdl_google)$rsquare
+summary(spike_mdl_doctor)$rsquare
+summary(spike_mdl_cmu)$rsquare
+summary(spike_mdl_all)$rsquare
+```
+
+Starting with the county covariates (CHR) data as a baseline, we add other data sets one at a time to understand its incremental predictiveness. Facebook surveys add virtually nothing, but the Google surveys provide a significant ~60% lift while Doctor visits appear to be noise that hurts the fit. Overall $r^2$ for deaths is quite low with the majority of the prediction power in the CHR covariates and additional value add through the Google surveys.
+
+### Variable importance 
+
+```{r fig.height=12, fig.width=6}
+plot(spike_mdl_chr, "scaled.coefficients", cex.axis = 0.6)
+plot(spike_mdl_facebook, "scaled.coefficients", cex.axis = 0.6)
+plot(spike_mdl_google, "scaled.coefficients", cex.axis = 0.6)
+plot(spike_mdl_doctor, "scaled.coefficients", cex.axis = 0.6)
+plot(spike_mdl_cmu, "scaled.coefficients", cex.axis = 0.6)
+plot(spike_mdl_all, "scaled.coefficients", cex.axis = 0.6)
+```
+
+# Appendix
+
+## Sample size - smoothed vs raw
+
+```{r eval=FALSE, fig.height=9, fig.width=9, include=FALSE}
+dat %>%
+  group_by(date, state) %>%
+  summarise_at(vars(starts_with("sample_size_")), sum) %>%
+  ggplot(aes(sample_size_raw_cli, sample_size_smoothed_cli, color = state)) +
+  geom_point() + theme(legend.title = element_blank()) -> p
+plotly::ggplotly(p)
+```
+
+This isn't very important but just an artifact of the data worth thinking about.
+
+
+
+## Time FE
+
+```{r eval=FALSE, include=FALSE}
+county_preds %>%
+  mutate(place = paste(county, county, sep = ", ")) %>%
+  select(date, place, cases, deaths, value_raw_cli, value_smoothed_cli,
+         life.length, life.quality, health.behavior, clinical.care, socio.econ,
+         environment, Population) %>%
+  mutate_at(vars(-place, -date), as.numeric) %>%
+  group_by(place) %>%
+  mutate(max_positive_test_rate = max(cases)/max(Population),
+         max_case_fatality_rate = max(deaths)/max(cases)) %>%
+  ungroup() %>%
+  filter_at(vars(starts_with("value_")), all_vars(!is.na(.))) %>%
+  select(-Population, -value_smoothed_cli, -cases, -deaths) %>%
+  mutate(date = as.factor(date),
+         clinical.care = as.numeric(clinical.care)) -> dat
+
+lm(max_positive_test_rate ~ value_raw_cli + date + life.length +
+   life.quality + health.behavior + clinical.care + socio.econ,
+   data = dat) %>% summary()
+lm(max_case_fatality_rate ~ value_raw_cli + date + life.length +
+   life.quality + health.behavior + clinical.care + socio.econ,
+   data = dat) %>% summary()
+```
+
+Running the regression on the latest JHU infection rate using time fixed effects produces an r^2 on par with the initial regression specification. Adding county level data adds a 10% (3pp) to $r^2$.
+
+This doesn't add a lot more predictive power from what we had seen before.
+
+#### Deaths
+
+Let's do the same thing with deaths instead of cases:
+
+```{r eval=FALSE, include=FALSE}
+(r2_dat <- county_preds %>%
+   filter(!is.na(sample_size_raw_cli)) %>%
+   mutate_at(vars(-state, -county), as.numeric) %>%
+   group_by(FIPS, state, county, life.length, life.quality, health.behavior,
+            clinical.care, socio.econ, environment) %>%
+   arrange(date) %>%
+   summarise(
+     case_fatality_rate_jhu = sqrt(max(deaths) / max(Population)),
+     infection_rate_goog = sqrt(mean(value_raw_cli)))) %>%
+  ggplot(aes(case_fatality_rate_jhu, infection_rate_goog, label = county)) +
+  geom_point() -> p
+ggplotly(p)
+```
+
+```{r eval=FALSE, include=FALSE}
+(mdl0 <- r2_dat %>%
+   lm(case_fatality_rate_jhu ~ infection_rate_goog, data = .)) %>% summary()
+```
+
+r^2 drops a bit from cases but still very high (0.43).  Perhaps driven by a lot of zeroes in the JHU data. What does it look like without the zeros?
+
+```{r eval=FALSE, include=FALSE}
+(mdl0_nozeroes <- r2_dat %>%
+   filter(case_fatality_rate_jhu != 0) %>%
+   lm(case_fatality_rate_jhu ~ infection_rate_goog, data = .)) %>% summary()
+```
+
+r^2 jumps back to to levels seen with the cases data which feels very high.  We have to be cognizant that deaths would materialize long after reported symptoms but we could be catching correlations where many counties are still in the middle of having both a high infection rate and resulting high number of deaths.
+
+Lets layer on some more county-level predictors.
+
+```{r eval=FALSE, include=FALSE}
+(mdl1 <- r2_dat %>%
+   lm(case_fatality_rate_jhu ~ infection_rate_goog +  life.length +
+        life.quality + health.behavior +  clinical.care + socio.econ + 
+        environment, data = .)) %>% summary()
+```
+We see about a 11% bump (0.05pp) in r^2 from the additional covariates.
+
+What's interesting is the important variables shift from `health.behavior` and `environment` to other factors more relevant to deaths: `life.length`, `health.behavior`, and `clinical.care`. The `environment` factor drops.
+
+```{r eval=FALSE, include=FALSE}
+broom::augment(mdl0) %>%
+  ggplot(aes(case_fatality_rate_jhu, .fitted)) +
+  geom_point()
+
+broom::augment(mdl1) %>%
+  ggplot(aes(case_fatality_rate_jhu, .fitted)) +
+  geom_point()
+```
+
+We can see the predictions getting tighter with the added covariates.
+
+#### Predicting changes
+
+In the previous example we looked at a cross-sectional correlation across counties but these surveys will be best suited to predict changes over time. Ideally we'd like changes in the survey response to be reflective of changes in the underlying infection rate so we visualize these trends below. We expect cases (and even more so deaths) to be lagged indicators for these symptom surveys.
+
+```{r eval=FALSE, fig.height=9, fig.width=9, message=TRUE, include=FALSE, warnings=FALSE}
+(r2_dat <- county_preds %>%
+   mutate_at(vars(-state, -county, -date), as.numeric) %>%
+   # per county
+   group_by(date, state)  %>%
+   summarise(cases = sum(cases, na.rm = TRUE),
+             value_smoothed_cli = mean(value_smoothed_cli, na.rm = TRUE)) %>%
+   group_by(state) %>%
+   arrange(date) %>%
+   # infection_rate jhu
+   mutate(new_cases_jhu = (cases - lag(cases)),
+          infection_rate_goog = lag(value_smoothed_cli, 0) / 100) %>%
+   filter(!is.na(new_cases_jhu)) %>%
+   mutate(new_cases_jhu = predict(
+     loess(new_cases_jhu ~ as.numeric(date))))) %>%
+  gather(type, value, infection_rate_goog, new_cases_jhu) %>%
+  group_by(type, state) %>%
+  arrange(date) %>%
+  mutate(change = last(na.omit(value)) - first(na.omit(value))) %>%
+  group_by(type) %>%
+  mutate(change_rank_asc = dense_rank(change),
+         change_rank_desc = dense_rank(desc(change))) %>%
+  ungroup() %>%
+  filter(change_rank_asc <= 5 | change_rank_desc <= 5) %>%
+  filter(date >= "2020-04-01") %>%
+  ggplot(aes(date, value, color = state)) + geom_line() +
+  facet_wrap(vars(type), scales = "free_y", ncol = 1) +
+  theme(legend.position = "bottom", legend.title = element_blank()) -> p
+ggplotly(p)
+```
+
+Repeat for deaths:
+```{r eval=FALSE, fig.height=9, fig.width=9, message=TRUE, include=FALSE, warnings=FALSE}
+(r2_dat <- county_preds %>%
+   mutate_at(vars(-state, -county, -date), as.numeric) %>%
+   # per county
+   group_by(date, state)  %>%
+   summarise(deaths = sum(deaths, na.rm = TRUE),
+             value_smoothed_cli = mean(value_smoothed_cli, na.rm = TRUE)) %>%
+   group_by(state) %>%
+   arrange(date) %>%
+   # infection_rate jhu
+   mutate(new_deaths_jhu = (deaths - lag(deaths)),
+          infection_rate_goog = lag(value_smoothed_cli, 0) / 100) %>%
+   filter(!is.na(new_deaths_jhu)) %>%
+   mutate(new_deaths_jhu = predict(
+     loess(new_deaths_jhu ~ as.numeric(date))))) %>%
+  gather(type, value, infection_rate_goog, new_deaths_jhu) %>%
+  group_by(type, state) %>%
+  arrange(date) %>%
+  mutate(change = last(na.omit(value)) - first(na.omit(value))) %>%
+  group_by(type) %>%
+  mutate(change_rank_asc = dense_rank(change),
+         change_rank_desc = dense_rank(desc(change))) %>%
+  ungroup() %>%
+  filter(change_rank_asc <= 5 | change_rank_desc <= 5) %>%
+  filter(date >= "2020-04-01") %>%
+  ggplot(aes(date, value, color = state)) + geom_line() +
+  facet_wrap(vars(type), scales = "free_y", ncol = 1) +
+  theme(legend.position = "bottom", legend.title = element_blank()) -> p
+ggplotly(p)
+```
+
+## Replicate Correlation Analysis
+
+From [here](https://cmu-delphi.github.io/covidcast/R-notebooks/signal_correlations.html).
+
+```{r eval=FALSE, include=FALSE}
+sources <- c("doctor-visits", "fb-survey", "google-survey", "ght")
+signals <- c("smoothed_cli", "smoothed_cli", "smoothed_cli", "smoothed_search")
+start_date <- ymd("20200411")
+end_date <- ymd("20200417")
+
+covcast_daily <- read_csv("covcast_daily.csv", col_types = "cccccnnnnD") %>%
+  filter(signal %in% signals & data_source %in% sources &
+           between(date, start_date, end_date)) %>%
+  mutate(FIPS = as.numeric(geo_value))
+```
+
+```{r eval=FALSE, include=FALSE}
+covcast_daily %>%
+  filter(geo_type == "county") %>%
+  inner_join(jhu, by = c("FIPS", "date")) %>%
+  group_by(data_source, signal, FIPS, Population) %>%
+  # do we really want to take the mean of cumulative cases? (JHU)
+  summarise(value = mean(value),
+            cases = mean(cases),
+            pop = max(Population)) %>%
+  ungroup() %>%
+  mutate(pop_cdf = round(cume_dist(-Population) * 100)) %>%
+  group_by(data_source, signal, pop_cdf) %>%
+  summarise(pop = max(pop),
+            cor_pearson = cor(cases, value, method = "pearson"),
+            cor_spearman = cor(cases, value, method = "spearman")) %>%
+  ggplot(aes(pop, cor_spearman)) + geom_line() +
+  scale_x_log10() +
+  facet_wrap(vars(data_source, signal), ncol = 1)
+```
+
+## County coverage
+
+## Time fixed effects
+
+We try a similar model with time fixed effects.
+
+### Cases
+
+```{r eval=FALSE, include=FALSE}
+tfe_cases <- county_preds %>%
+  filter(!is.na(value_raw_cli)) %>%
+  mutate(infection_rate_jhu = jhu_cases / jhu_population,
+         infection_rate_goog = value_raw_cli) %>%
+  select_if(~ mean(is.na(.x)) < 0.01) %>%
+  select(-county, -state, -fips, -ends_with("_cli"), -jhu_population,
+         -jhu_deaths, -jhu_cases)
+
+tfe_cases %>%
+  mutate_at(vars(date), as.factor) %>%
+  lm(infection_rate_jhu ~ infection_rate_goog, data = .) %>%
+  summary()
+```
+
+```{r eval=FALSE, include=FALSE}
+tfe_cases %>%
+  mutate_at(vars(date), as.factor) %>%
+  lm(infection_rate_jhu ~ ., data = .) %>%
+  summary()
+```
+
+```{r eval=FALSE, include=FALSE}
+# cv lasso
+tfe_cases <- tfe_cases %>% mutate_at(vars(date), as.factor)
+
+l1_mdl_cv <- cv.glmnet(infection_rate_jhu ~ ., data = tfe_cases)
+
+lm_mdl_min <- tfe_cases %>%
+  mutate_at(vars(date), as.factor) %>%
+  glmnet(infection_rate_jhu ~ ., data = .,
+         lambda = l1_mdl_cv$lambda.min)
+
+lm_mdl_1se <- tfe_cases %>%
+  mutate_at(vars(date), as.factor) %>%
+  glmnet(infection_rate_jhu ~ ., data = .,
+         lambda = l1_mdl_cv$lambda.1se)
+
+coef_min <- coef(lm_mdl_min) %>% as.matrix() %>%
+  as.data.frame() %>% rownames_to_column("predictor") %>%
+  filter(s0 != 0) %>%
+  mutate(dev.ratio = lm_mdl_min$dev.ratio)
+
+coef_1se <- coef(lm_mdl_1se) %>% as.matrix() %>%
+  as.data.frame() %>% rownames_to_column("predictor") %>%
+  filter(s0 != 0) %>%
+  mutate(dev.ratio = lm_mdl_1se$dev.ratio)
+
+full_join(coef_1se, coef_min, by = "predictor", suffix = c(".1se", ".min")) %>%
+  select(predictor, sort(current_vars()))
+```
+
+### Deaths
+
+```{r eval=FALSE, include=FALSE}
+tfe_deaths <- county_preds %>%
+  mutate_at(vars(date), as.factor) %>%
+  filter(!is.na(value_raw_cli)) %>%
+  mutate(fatality_rate_jhu = jhu_deaths / jhu_population,
+         infection_rate_goog = value_raw_cli) %>%
+  select_if(~ mean(is.na(.x)) < 0.01) %>%
+  select(-county, -state, -fips, -ends_with("_cli"), -jhu_population,
+         -jhu_cases, -jhu_deaths)
+
+tfe_deaths %>%
+  mutate_at(vars(date), as.factor) %>%
+  lm(fatality_rate_jhu ~ infection_rate_goog + date, data = .) %>%
+  summary()
+```
+
+```{r eval=FALSE, include=FALSE}
+tfe_deaths %>%
+  mutate_at(vars(date), as.factor) %>%
+  lm(fatality_rate_jhu ~ ., data = .) %>%
+  summary()
+```
+
+```{r eval=FALSE, include=FALSE}
+tfe_deaths <- tfe_deaths %>% mutate_at(vars(date), as.factor)
+# cv lasso
+l1_mdl_cv <- cv.glmnet(fatality_rate_jhu ~ ., data = tfe_deaths)
+
+lm_mdl_min <- tfe_deaths %>%
+  glmnet(fatality_rate_jhu ~ ., data = .,
+         lambda = l1_mdl_cv$lambda.min)
+
+lm_mdl_1se <- tfe_deaths %>%
+  glmnet(fatality_rate_jhu ~ ., data = .,
+         lambda = l1_mdl_cv$lambda.1se)
+
+coef_min <- coef(lm_mdl_min) %>% as.matrix() %>%
+  as.data.frame() %>% rownames_to_column("predictor") %>%
+  filter(s0 != 0 & !str_starts(predictor, "date")) %>%
+  mutate(dev.ratio = lm_mdl_min$dev.ratio)
+
+coef_1se <- coef(lm_mdl_1se) %>% as.matrix() %>%
+  as.data.frame() %>% rownames_to_column("predictor") %>%
+  filter(s0 != 0 & !str_starts(predictor, "date")) %>%
+  mutate(dev.ratio = lm_mdl_1se$dev.ratio)
+
+full_join(coef_1se, coef_min, by = "predictor", suffix = c(".1se", ".min")) %>%
+  select(predictor, sort(current_vars()))
+```
+## LASSO
+
+To address our concerns with overfitting we do a regularized regression via LASSO:
+
+```{r eval=FALSE, include=FALSE}
+# cv lasso
+l1_mdl_cv <- cv.glmnet(infection_rate_jhu ~ ., data = mean_cases)
+
+lm_mdl_min <- mean_cases %>%
+  glmnet(infection_rate_jhu ~ ., data = .,
+         lambda = l1_mdl_cv$lambda.min)
+
+lm_mdl_1se <- mean_cases %>%
+  glmnet(infection_rate_jhu ~ ., data = .,
+         lambda = l1_mdl_cv$lambda.1se)
+
+coef_min <- coef(lm_mdl_min) %>% as.matrix() %>%
+  as.data.frame() %>% rownames_to_column("predictor") %>%
+  filter(s0 != 0) %>%
+  mutate(dev.ratio = lm_mdl_min$dev.ratio)
+
+coef_1se <- coef(lm_mdl_1se) %>% as.matrix() %>%
+  as.data.frame() %>% rownames_to_column("predictor") %>%
+  filter(s0 != 0) %>%
+  mutate(dev.ratio = lm_mdl_1se$dev.ratio)
+
+full_join(coef_1se, coef_min, by = "predictor", suffix = c(".1se", ".min")) %>%
+  select(predictor, sort(everything()))
+```
