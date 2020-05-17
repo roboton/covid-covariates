@@ -1,0 +1,52 @@
+---
+title: "Untitled Draft"
+author: "Report Author"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+## Analysis
+
+```{r}
+drake::readd(county_health_clean) %>%
+  summarise_at(vars(ends_with(" raw value")), ~ mean(is.na(.x))) %>%
+  gather(var, missing, everything()) %>%
+  arrange(missing) %>%
+  mutate(missing_degree = case_when(
+    row_number() <= 41 ~ "low",
+    row_number() <= 61 ~ "medium",
+    TRUE ~ "high" )) %>%
+  mutate(x = row_number()) %>%
+  ggplot(aes(x, missing, color = missing_degree)) +
+  geom_line() +
+  geom_vline(xintercept = c(41, 61), alpha = 0.4) -> p
+plotly::ggplotly(p)
+```
+
+```{r}
+drake::readd(covidcast_county) %>%
+  unite(metric, data_source, signal) %>%
+  group_by(date, metric) %>%
+  summarise_at(vars(value), mean, na.rm = T) %>%
+  ungroup() %>%
+  pivot_wider(names_from = c(metric), values_from = value) %>%
+  select(-date) %>% as.matrix() %>% cor(use = "pairwise.complete.obs") %>%
+  ggcorrplot::ggcorrplot()
+```
+
+## Reproducibility
+
+```{r}
+## datetime
+Sys.time() 
+
+## repository
+git2r::repository()
+
+## session info
+sessionInfo()
+```

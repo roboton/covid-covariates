@@ -1,0 +1,30 @@
+---
+title: "Getting started with drake"
+output: html_notebook
+---
+
+Getting started with [`drake`](https://books.ropensci.org/drake/).
+
+```{r}
+install.packages("drake")
+remotes::install_github("milesmcbain/dflow")
+```
+
+Set up file structure scaffordling:
+
+```{r}
+dflow::use_dflow()
+```
+
+Add final product Rmd files dependent on pipeline:
+
+```{r}
+dflow::use_rmd("cov-delphi.Rmd")
+dflow::use_rmd("cov-mobility.Rmd")
+```
+
+Ignore intermediate drake files for check-in:
+
+```{r}
+dflow::use_gitignore()
+```

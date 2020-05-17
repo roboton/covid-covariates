@@ -1,0 +1,35 @@
+---
+title: "COVID prediction"
+author: "Report Author"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+## Analysis
+
+### Missing values
+
+```{r fig.height=12}
+readd(county_joined_all) %>%
+  summarise_all(~ mean(is.na(.x))) %>%
+  gather(column, pct_missing) %>%
+  arrange(desc(pct_missing))
+```
+
+
+## Reproducibility
+
+```{r}
+## datetime
+Sys.time() 
+
+## repository
+git2r::repository()
+
+## session info
+sessionInfo()
+```
