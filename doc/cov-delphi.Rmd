@@ -35,7 +35,15 @@ drake::readd(covidcast_county) %>%
   ungroup() %>%
   pivot_wider(names_from = c(metric), values_from = value) %>%
   select(-date) %>% as.matrix() %>% cor(use = "pairwise.complete.obs") %>%
-  ggcorrplot::ggcorrplot()
+  ggcorrplot::ggcorrplot(type = "upper")
+```
+
+### County-level
+
+```{r}
+drake::readd(covidcast_county_mean) %>%
+  summarise_at(vars(-fips5), ~ mean(!is.na(.x))) %>%
+  gather()
 ```
 
 ## Reproducibility

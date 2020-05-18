@@ -14,5 +14,6 @@ fetch_state_fips <- function(
   GET(url, write_disk(tf <- tempfile(fileext = ".xlsx")))
   read_xlsx(tf, skip = skip) %>%
     select(name=`Name`, state_fips=`State (FIPS)`) %>%
+    filter(state_fips != "00") %>%
     return()
 }

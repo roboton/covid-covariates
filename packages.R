@@ -4,20 +4,23 @@ library(dotenv)
 library(drake)
 library(rmarkdown)
 
-# added
+# Time series 
 library(zoo)
 library(EnvCpt)
 library(CausalImpact)
+
+# Read Census FIPS xlsx
 library(httr)
 library(readxl)
+
+# Presentation
 library(plotly)
 library(DT)
-library(rvest)
-library(jsonlite)
 
-# always last
-library(tidyverse)
+# Data munging
+library(jsonlite)
 library(lubridate)
+library(tidyverse)
 
 # prioritizing namespaces
 conflict_prefer("select", "dplyr")

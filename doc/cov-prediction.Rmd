@@ -6,7 +6,6 @@ output: html_notebook
 ---
 
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = FALSE)
 ```
 
 ## Analysis
@@ -15,11 +14,60 @@ knitr::opts_chunk$set(echo = FALSE)
 
 ```{r fig.height=12}
 readd(county_joined_all) %>%
-  summarise_all(~ mean(is.na(.x))) %>%
+  summarise_all(~ mean(!is.na(.x))) %>%
   gather(column, pct_missing) %>%
-  arrange(desc(pct_missing))
+  arrange(desc(desc(pct_missing)))
 ```
 
+```{r}
+missing_seq <- seq(0.05, 0.95, by = 0.1)
+missing_mdls <- lapply(missing_seq, FUN = function(thresh) {
+  readd(county_joined_all) %>%
+    select_if(~ mean(is.na(.x)) < thresh) %>%
+    drop_na() %>% 
+    select(-starts_with("jhu-csse"), `jhu-csse_confirmed_incidence_prop`,
+           -name_county, -state_fips, -name_state, -fips5) %>%
+    lm.spike(`jhu-csse_confirmed_incidence_prop` ~ ., data = .,
+             niter=10000)
+})
+```
+```{r}
+tmp <- sapply(missing_mdls, FUN = function(x) {
+    plot(x, "scaled.coefficients", inclusion.thresh = 0.5,
+         main = paste(nrow(x$training.data), "counties")) })
+```
+```{r}
+rsquares <- sapply(missing_mdls, FUN = function(x) {
+  summary(x)$rsquare[["Mean"]]
+})
+plot(missing_seq, rsquares)
+```
+
+```{r}
+pop_seq <- seq(5, 15, by = 1)
+pop_mdls <- lapply(pop_seq, FUN = function(thresh) {
+  readd(county_joined_all) %>%
+    filter(exp(`Population raw value`) > thresh) %>% 
+    drop_na() %>% 
+    select(-starts_with("jhu-csse"), `jhu-csse_confirmed_incidence_prop`,
+           -name_county, -state_fips, -name_state, -fips5) %>%
+    lm.spike(`jhu-csse_confirmed_incidence_prop` ~ ., data = .,
+             niter=10000)
+})
+```
+
+```{r}
+tmp <- sapply(pop_mdls, FUN = function(x) {
+    plot(x, "scaled.coefficients", inclusion.thresh = 0.5,
+         main = paste(nrow(x$training.data), "counties")) })
+```
+
+```{r}
+rsquares <- sapply(pop_mdls, FUN = function(x) {
+  summary(x)$rsquare[["Mean"]]
+})
+plot(pop_seq, rsquares, type = "l")
+```
 
 ## Reproducibility
 

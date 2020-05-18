@@ -11,17 +11,18 @@ knitr::opts_chunk$set(echo = FALSE)
 
 # Missing data
 
-```{r}
+```{r eval=FALSE}
 drake::readd(google_mob_fips) %>% 
-  filter(geo_name != "United States") %>%
-  filter_at(vars(ends_with("_fips")), all_vars(is.na(.)))
+  filter(is.na(fips5)) %>%
+  filter(country_region_code == "US")
 ```
 
 We were able to match all counties from the Google Mobility data set to FIPS codes from the US Census Bureau.
 
 ```{r}
 drake::readd(google_mob_fill) %>%
-  group_by(country_region, state_name, county_name, value_type) %>%
+  filter(country_region_code == "US") %>%
+  group_by(country_region, sub_region_1, sub_region_2, value_type) %>%
   summarise(
     start_date = min(date),
     end_date = max(date),
@@ -35,8 +36,10 @@ We also ensured that missing data interpolation ensured consistent number of dat
 ```{r}
 drake::readd(google_mob_cpt) %>%
   select(-data, -cpt_mdl) %>%
-  sample_n(1000) %>%
-  DT::datatable()
+  summarise_if(~ is.numeric(.x) | lubridate::is.Date(.x) | lubridate::is.difftime(.x),
+               list(missing = ~ mean(is.na(.x)), max = max, mean = mean, min = min),
+               na.rm = TRUE) %>%
+  gather()
 ```
 
 ## Reproducibility
