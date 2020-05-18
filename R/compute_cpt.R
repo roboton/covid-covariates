@@ -68,7 +68,5 @@ extract_cpt_params <- function(cpt_data, cpt_mdl, mdl_name = "meancpt") {
     mean_after= mean_after,
     var_before = var_before,
     var_after= var_after,
-    seg_start_date = dates[start_pts[first_idx]],
-    seg_end_date = dates[end_pts[last_idx]],
     revert = revert)
 }

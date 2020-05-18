@@ -9,6 +9,8 @@ covid_covariates_plan <- drake::drake_plan(
   google_mob_cpt = compute_cpt(google_mob_fill),
   google_mob_csv = write_csv(select(google_mob_cpt, -cpt_mdl, -data),
                              file_out("data/google_mob_cpt.csv")),
+  google_mob_rds = write_rds(select(google_mob_cpt, -cpt_mdl, -data),
+                             file_out("data/google_mob_cpt.rds")),
   
   # County health rankings (US)
   county_health_raw = read_csv(
@@ -21,11 +23,15 @@ covid_covariates_plan <- drake::drake_plan(
   county_health_fill = impute_missing_chr(county_health_clean),
   county_health_csv = write_csv(county_health_fill,
                                 file_out("data/county_health.csv")),
+  county_health_rds = write_rds(county_health_fill,
+                                file_out("data/county_health.rds")),
   
   # COVIDcast Delphi (US)
   covidcast_daily = fetch_covidcast(),
   covidcast_csv = write_csv(
     covidcast_daily, file_out("data/covidcast_daily.csv")),
+  covidcast_rds = write_rds(
+    covidcast_daily, file_out("data/covidcast_daily.rds")),
   
   # County Join
   # Google mobility (US)
@@ -67,6 +73,8 @@ covid_covariates_plan <- drake::drake_plan(
               by = "fips5", suffix = c("", ".covcast")),
   county_joined_csv = write_csv(county_joined_all,
                                 file_out("data/county_joined.csv")),
+  county_joined_rds = write_rds(county_joined_all,
+                                file_out("data/county_joined.rds")),
 
   # RMarkdown
   cov_delphi = target(
