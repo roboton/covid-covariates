@@ -1,6 +1,6 @@
 ---
 title: "COVID prediction"
-author: "Robert On"
+author: "Robert On, Hal Varian"
 date: "`r format(Sys.time(), '%d %B, %Y')`"
 output:
   html_notebook:
@@ -11,7 +11,10 @@ The purpose of this notebook is to estimate the value of county level covariates
 
 ## Data description
 
-The data set we're working with is `county_joined_all` which is generated from a `drake` plan described here (TODO). This data set includes outcomes from [JHU CSSE](https://github.com/CSSEGISandData/COVID-19) and predictors from [Google Mobility Reports](https://www.google.com/covid19/mobility/), [County Health Rankings](https://www.countyhealthrankings.org/), and [CMU Delphi COVIDcast](https://cmu-delphi.github.io/delphi-epidata/api/covidcast.html).
+The data set we're working with is `county_joined_all` which is generated from a `drake` plan. `drake` plans help improve replicability as well as provide improved performance and caching by taking advantage of a DAG-based data dependancy graph. More [here](https://github.com/roboton/covid-covariates).
+![drake plan](cov-sankey.png)
+
+This data set includes outcomes from [JHU CSSE](https://github.com/CSSEGISandData/COVID-19) and predictors from [Google Mobility Reports](https://www.google.com/covid19/mobility/), [County Health Rankings](https://www.countyhealthrankings.org/), and [CMU Delphi COVIDcast](https://cmu-delphi.github.io/delphi-epidata/api/covidcast.html).
 
 ### Google Mobility Reports
 
@@ -83,7 +86,7 @@ lapply(missing_seq, FUN = function(thresh) {
 ggplotly(p)
 ```
 
-From a quick eye-ball it appears optimal to use 2170 counties with 101 predictors which suggests a threshold limiting us to use predictors with less than 31% missing values (`county_joined_full`). We can also experiment with a model with 3118 counties and 46 predictors with a 3% threshold (`county_joined_sparse`). A third model is one that has a rich set of predictors (144) but only covers 560 counties (`county_joined_rich`) that allows for 77% missing values.`
+From a quick eye-ball it appears optimal to use 2170 counties with 101 predictors which suggests a threshold limiting us to use predictors with less than 31% missing values (`county_joined_rich`). We can also experiment with a model with 3118 counties and 46 predictors with a 3% threshold (`county_joined_sparse`). A third model is one that has a full set of predictors (139) but only covers 295 counties (`county_joined_full`) that allows for 92% missing values.`
 
 ### Outcomes
 
@@ -101,7 +104,7 @@ prep_data <- function(thresh) {
               ~ str_remove(.x, "_percent_change_from_baseline"))
 }
 
-county_joined_full <- prep_data(0.77)
+county_joined_full <- prep_data(0.92)
 county_joined_rich <- prep_data(0.31)
 county_joined_sparse <- prep_data(0.03)
 ```
@@ -126,7 +129,11 @@ We notice in general that COVID cases and deaths are lower in the `sparse` data 
 
 ## Prediction
 
-With our two data sets (sparse and full) and two outcomes (proportion of confirmed incidence and deaths), we can go ahead and make predictions using our set of predictors. We start with a regularized regression with the [Spike-and-Slab](https://www.rdocumentation.org/packages/BoomSpikeSlab/versions/1.2.3/topics/lm.spike) package which provides a Bayesian approach towards variable selection similar to the LASSO.
+With our three data sets (sparse, rich and full) and two outcomes (proportion of confirmed incidence and deaths), we can go ahead and make predictions using our set of predictors. We start with a regularized regression with the [Spike-and-Slab](https://www.rdocumentation.org/packages/BoomSpikeSlab/versions/1.2.3/topics/lm.spike) package which provides a Bayesian approach towards variable selection similar to the LASSO. We also try square root and logit transformations of the response variables.
+
+### All variables
+
+Varied rows based on NAs.
 
 ```{r message=FALSE, warning=FALSE, results="hide"}
 iters <- 10000
@@ -202,16 +209,22 @@ mdls <- list(cases_full, deaths_full, cases_rich, deaths_rich,
              cases_sparse_logit, deaths_sparse_logit)
 mdl_names <- c("cases_full", "deaths_full", "cases_rich", "deaths_rich",
                "cases_sparse", "deaths_sparse",
-               "cases_full_sqrt", "deaths_full_sqrt", "cases_rich_sqrt", "deaths_rich_sqrt",
+               "cases_full_sqrt", "deaths_full_sqrt", "cases_rich_sqrt", 
+               "deaths_rich_sqrt",
                "cases_sparse_sqrt", "deaths_sparse_sqrt",
-               "cases_full_logit", "deaths_full_logit", "cases_rich_logit", "deaths_rich_logit",
+               "cases_full_logit", "deaths_full_logit", "cases_rich_logit", "
+               deaths_rich_logit",
                "cases_sparse_logit", "deaths_sparse_logit")
 rsq_df <-bind_rows(
   tibble(
     model = mdl_names[1:12],
+    predictors = mdls[1:12] %>% map_int(~ ncol(.x$training.data)),
+    counties = mdls[1:12] %>% map_int(~ nrow(.x$training.data)),
     rsq = mdls[1:12] %>% map_dbl(~ summary(.x)$rsquare[["Mean"]])),
   tibble(
     model = mdl_names[13:18],
+    predictors = mdls[13:18] %>% map_int(~ ncol(.x$training.data)),
+    counties = mdls[13:18] %>% map_int(~ nrow(.x$training.data)),
     rsq = mdls[13:18] %>% map_dbl(~ summary(.x)[["deviance.r2"]])))
 
 rsq_df
@@ -226,21 +239,33 @@ tmp <- sapply(1:length(mdls), FUN = function(x) {
                     paste0("rsq: ", round(rsq, 2)), sep = " - ")) })
 ```
 
-```{r message=FALSE, warning=FALSE, results="hide"}
-cases_rich_sqrt_chr <- county_joined_rich %>%
-  select(37:97, -starts_with("jhu-"), `jhu-csse_confirmed_incidence_prop`) %>%
-  lm.spike(sqrt(`jhu-csse_confirmed_incidence_prop`) ~ ., data = ., niter=iters)
+### Dataset predictive value
 
-cases_rich_sqrt_mob <- county_joined_rich %>%
-  select(1:36, -starts_with("jhu-"), `jhu-csse_confirmed_incidence_prop`) %>%
-  lm.spike(sqrt(`jhu-csse_confirmed_incidence_prop`) ~ ., data = ., niter=iters)
+What is the predictive value for the mobility, community health rankings, and COVIDcast data? Only the full model has variables from all data sets.
+
+```{r message=FALSE, warning=FALSE, results="hide"}
+cases_full_mob <- county_joined_full %>%
+  select(1:60, -starts_with("jhu-"), `jhu-csse_confirmed_incidence_prop`) %>%
+  lm.spike(`jhu-csse_confirmed_incidence_prop` ~ ., data = ., niter=iters)
+
+cases_full_chr <- county_joined_full %>%
+  select(61:121, -starts_with("jhu-"), `jhu-csse_confirmed_incidence_prop`) %>%
+  lm.spike(`jhu-csse_confirmed_incidence_prop` ~ ., data = ., niter=iters)
+
+cases_full_cmu <- county_joined_full %>%
+  select(122:129, -starts_with("jhu-"), `jhu-csse_confirmed_incidence_prop`) %>%
+  lm.spike(`jhu-csse_confirmed_incidence_prop` ~ ., data = ., niter=iters)
 ```
 
 ```{r}
-mdls <- list(cases_rich_sqrt_chr, cases_rich_sqrt_mob)
-mdl_names <- c("cases_rich_sqrt_chr", "cases_rich_sqrt_mob")
+mdls <- list(cases_full_mob, cases_full_chr,
+             cases_full_cmu)
+mdl_names <- c("cases_full_mob", "cases_full_chr",
+               "cases_full_cmu")
 rsq_df <- tibble(
   model = mdl_names,
+  predictors = mdls %>% map_int(~ ncol(.x$training.data)),
+  counties = mdls %>% map_int(~ nrow(.x$training.data)),
   rsq = mdls %>% map_dbl(~ summary(.x)$rsquare[["Mean"]]))
 rsq_df
 ```
