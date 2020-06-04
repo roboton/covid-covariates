@@ -1,0 +1,191 @@
+---
+title: "Detecting covid-19 cases using machine learning"
+author: "Hal Varian and Rob On"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  pdf_document: default
+  html_notebook: default
+  code_folding: hide
+---
+```{r include=FALSE}
+library(drake)
+library(huxtable)
+library(tidyverse)
+nber_dat <- read_csv("https://ond3.com/covdata/nber_dat.csv")
+```
+
+During the spring of 2020, the authors worked on a project to nowcast the number of COVID-19 cases by US county.   The predictive variables were Google Trends, Google Surveys, doctor visits, mobility data, country characteristics and so on.   We applied a number of machine learning techniques for model selection and estimation.
+
+In this paper we will describe what we did and what were the lessons learned.  The paper might be included as part of a session working on COVID-19 related issues, or it could stand on its own.
+
+
+### Motivation
+
+Confirmed cases and deaths are reported daily by [Johns Hopkins](https://coronavirus.jhu.edu/us-map) and are updated on a periodic basis.   However, these data are often reported with a lag and it would be helpful to have a contemporaneous prediction (a nowcast) based on easily observed predictors for at least two reasons:
+
+1. this would help hospitals ready for an increase in patients, and
+2. this would help contract tracing efforts focus on areas where there might be potential outbreaks.
+
+### What we did
+
+This notebook describes what we have done so far.  By September we expect to have more materials.  The primary innovation was to use a survey based predictor based on Google Surveys.  Our original survey question was:
+
+“Do you or anyone in your household have a fever of at least 100 degrees along with a sore throat or a cough?”
+
+This is based on the CDC survey question for Influenza like illness (ILI). 
+
+However, this question had to be dropped so we switched to a proxy question of the form:
+
+“Do you know someone in your community who is sick with a fever, along with a cough, shortness of breath, or difficulty breathing right now?”  Proxy questions of this sort are often used in medical or political surveys, on the grounds that people can be much more willing to disclose information about others than about themselves.
+
+Much to our surprise, the proxy question worked far better than the original question.  This is an important lesson for other researchers!
+
+### Estimation
+
+Our basis model is very simple.  We have two variables,  $pJ$, defined as confirmed cases as a fraction of population from John Hopkins, and $pG$, defined as the fraction of Google Survey respondents who answer “yes” to the proxy question.
+
+Our hypothesis is that $pJ = k*pG + e$ where $k$ is a parameter to be estimated and $e$ is an error term.  We could estimate this equation directly, but we could also use the definitions of $pG$ and $pJ$ to write:
+		            
+$$
+\begin{aligned}
+\frac{cases}{population} = k * \frac{yes}{yes+no} + e
+\end{aligned}
+$$
+		            
+Taking logs:
+$$
+\begin{aligned}
+log(cases)  = log(k) + \beta_1 log(population) + \beta_2 log (pG) + log(e) \\ = log(k) + \beta_1 log(population) + \beta_2 log (yes) - \beta_3 log(yes+no) + log(e)
+\end{aligned}
+$$
+
+We can estimate either of these equations depending on data availability.  We can also add various controls such as country health characteristics, lagged values of cases, county fixed effects, and so on.  But even if we use this very simple specification, we get nice results, as shown in this plot of actual versus predicted cases.
+
+```{r}
+goog_mdl <- lm(log(jhu_csse_confirmed_incidence_num_value + 1) ~
+     log(google_survey_raw_cli_value + 1) +
+       log(google_survey_raw_cli_sample_size + 1) +
+       log(population + 1), 
+   data = nber_dat %>%
+     column_to_rownames("county_name"))
+huxreg(goog_mdl, statistics = c(N = "nobs", R2 = "r.squared"))
+
+data.frame(fitted = goog_mdl$fitted.values, actual = goog_mdl$model[,1],
+           population = goog_mdl$model[,4], fips = rownames(goog_mdl$model)) %>%
+  ggplot(aes(actual, fitted, label = fips)) + geom_hex(binwidth = 0.2) +
+  theme_minimal() + theme(legend.position = "none") + coord_fixed() -> p
+  
+  #geom_smooth(formula = y ~ x, method = "lm") -> p
+p #plotly::ggplotly(p)
+```
+
+### Important lessons
+
+#### Think of what you are trying to estimate and why?
+
+TODO: We want to predict cases, ahead of time to provide time for the local jurisdiction to contain the virus. Unfortunately it doesn't look like we're getting a lot of additional signal from the surveys. See that [here].
+
+#### Proxy questions are your friends.
+
+Earlier we saw how well the community-based question in Google surveys proxied for county-level incidence but how would this compare to a question that simply asked the question directly to an individual? An analogous set of surveys run by Facebook asked the question at the individual level which initially did not have much predictive value until it was changed to mimic the community-based Google question.
+
+```{r}
+fb_indiv_spec <- lm(
+  log(jhu_csse_confirmed_incidence_num_value + 1) ~
+    log(fb_survey_raw_cli_value + 1) +
+    log(fb_survey_raw_cli_sample_size + 1) +
+    log(population + 1),
+  data = nber_dat %>% column_to_rownames("county_name"))
+
+fb_comm_spec <- lm(
+  log(jhu_csse_confirmed_incidence_num_value + 1) ~
+    log(fb_survey_raw_hh_cmnty_cli_value + 1) +
+    log(fb_survey_raw_hh_cmnty_cli_sample_size + 1) +
+    log(population + 1),
+   data = readd(nber_dat) %>% column_to_rownames("county_name"))
+
+fb_comm_nohh_spec <- lm(log(jhu_csse_confirmed_incidence_num_value + 1) ~
+     log(fb_survey_raw_nohh_cmnty_cli_value + 1) +
+       log(fb_survey_raw_nohh_cmnty_cli_sample_size + 1) +
+       log(population + 1),
+   data = readd(nber_dat) %>% column_to_rownames("county_name"))
+
+ht <- huxreg(fb_indiv_spec, fb_comm_spec, fb_comm_nohh_spec,
+             statistics = c(N = "nobs", R2 = "r.squared"))
+huxtable::position(ht) <- "left"
+ht
+```
+
+We see a significant increase in $r^2$ from 0.595 to 0.806 using the community measures.
+
+#### Data cleansing matters
+
+All data for this notebook are scrapped directly from live sources on the web so it can be easily updated with the most recent data. A system of data pipelines and caching enables efficient and consistent fetching, cleaning, manipulation, provenance and of analysis of the data.  The figure below describes the system of data processes that produce the figures and tables in this document. This system is enabled by a package named [drake](https://github.com/ropensci/drake).
+![Data pipeline from drake plan](nber-sankey.png)
+
+#### Variable selection via spike-slab is much easier than with lasso.
+
+TODO: What example should go here? The prediction model with everything in it? Modeling the county covariates to deaths? I have a feeling we could have done better with the SuperLearner on the data set that only included the 595 counties if we think that's worth trying again.
+
+#### Using 595 counties is fine.
+
+From the specifications above you may have noticed only 595 counties had non-missing data for the survey predictors. With over 3,000 counties this may raise some concern about response bias from the survey.  The figure below shows each of the surveyed questionnaires and what percent of counties are covered by them.
+
+```{r}
+readd(nber_dat) %>%
+  select(population, contains("survey") & ends_with("_value")) %>%
+  gather(metric, value, -population) %>%
+  group_by(metric) %>%
+  summarise(`covered counties` = mean(!is.na(value))) %>%
+  mutate_at(vars(metric), ~ str_remove(.x, "_value")) %>%
+  ggplot(aes(metric, `covered counties`)) + geom_col() + coord_flip() +
+  ylim(0, 1) +
+  xlab(element_blank())
+```
+
+The Facebook and Google surveys cover less than 20% of counties. However if we look at the covered population of these counties we find that, by population, these counties cover more than 75% of the population in the US.
+
+```{r}
+nber_dat %>%
+  select(population, contains("survey") & ends_with("_value")) %>%
+  gather(metric, value, -population) %>%
+  filter(!is.nan(population)) %>%
+  group_by(metric) %>%
+  summarise(
+    `covered population` = sum(population[!is.nan(value)]) / sum(population)) %>%
+  mutate_at(vars(metric), ~ str_remove(.x, "_value")) %>%
+  ggplot(aes(metric, `covered population`)) + geom_col() + coord_flip() +
+  ylim(0, 1) + 
+  xlab(element_blank())
+```
+
+#### The decision loss function is important
+
+Better to err on the side of caution. The LINEX loss function (Varian, 1975) provides an asymmetric cost function to enable differentiated losses to overestimation and underestimation. The function is defined as follows:
+
+$$
+\begin{aligned}
+L(\theta, a) = e^{c(a - \theta)} -c(a - \theta) - 1, c \in R
+\end{aligned}
+$$
+
+where $a$ is your estimate for your parameter of interest $\theta$.
+
+```{r}
+gen_linex <- function(c) {
+  tibble(
+    c = c,
+    residuals = -10:10,
+    linex = exp(c * residuals) - c * residuals - 1,
+    c_neg = if_else(c < 0, "c < 0", "c > 0")) %>%
+    mutate(c = as.character(c))
+}
+
+lapply(seq(-0.2, 0.2, by = 0.05), gen_linex) %>%
+  bind_rows() %>% ggplot(aes(residuals, linex, color = c)) +
+  geom_line() + ggtitle("LINEX loss") + facet_wrap(vars(c_neg))
+```
+
+We can see how this can be useful in weighing our choices based on our predictions. Given a policy decision around a certain case threshold to allocate resources, we may want to be more conservative and treat underestimation more severely ($c < 0$).
+
+TODO: Example?

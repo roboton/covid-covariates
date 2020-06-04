@@ -4,6 +4,13 @@ library(dotenv)
 library(drake)
 library(rmarkdown)
 
+# Prediction
+library(SuperLearner)
+library(BoomSpikeSlab)
+library(tidymodels)
+library(ranger)
+library(pdp)
+
 # Time series 
 library(zoo)
 library(EnvCpt)
@@ -18,6 +25,7 @@ library(plotly)
 library(DT)
 
 # Data munging
+library(countrycode)
 library(jsonlite)
 library(lubridate)
 library(tidyverse)
@@ -28,3 +36,6 @@ conflict_prefer("filter", "dplyr")
 conflict_prefer("first", "dplyr")
 conflict_prefer("last", "dplyr")
 conflict_prefer("gather", "tidyr")
+conflict_prefer("discard", "purrr")
+conflict_prefer("partial", "pdp")
+conflict_prefer("lag", "dplyr")

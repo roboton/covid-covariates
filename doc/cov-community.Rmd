@@ -1,0 +1,415 @@
+---
+title: "COVID Nowcasting"
+author: "Robert On, Hal Varian"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+---
+
+This note is about how to forecast and nowcast the number of covid-19 cases at the county level. Better forecasts would be helpful in at least three ways: 1) early warning of local flareups, 2) capacity planning at hospitals, 3) early deployment of contact tracing.
+
+We have found that self-reported symptoms may be helpful in this regard. In our original specification we used Google Surveys to launch a nationwide web survey with a question modeled after the CDC standard, “Do you or anyone in your household have a fever of at least 100 degrees along with a sore throat or a cough?” The CDC definition of an “Influenza Like Illness” is a fever (temperature of 100°F…or greater) and a cough and/or a sore throat without a known cause other than influenza." [See this link](https://www.cdc.gov/flu/weekly/overview.htm).
+
+However, that question could not be used due to privacy issues. Instead we used a proxy question that said “Do you know someone in your community who is sick with a (fever, along with cough, shortness of breath, or difficulty breathing) right now?”
+
+Much to our surprise, the answers to this proxy question were substantially more predictive than the previous, more focused question. This is an important lesson for future survey designs.
+
+## Data Prep
+
+```{r message=FALSE, warning=FALSE}
+library(drake)
+library(tidyverse)
+
+```
+
+## Data Summary
+
+```{r}
+covidcast_county %>% mutate_if(is.character, as.factor) %>%
+  skimr::skim() %>%
+  select(-numeric.p0, -numeric.p50, -numeric.p100,
+         -numeric.sd, -factor.top_counts, -Date.median, -n_missing) %>%
+  mutate(skim_variable = str_remove(skim_variable, "(value_)|(sample_)|(chr_)"))
+```
+
+From a quick summary of columns we find that the JHU confirmed and death metrics are almost all there, followed by doctor visits, smoothed Facebook surveys, Google surveys, then raw Facebook surveys. Many county-level covariates are available as well.
+
+### Sample county plots
+
+```{r fig.height=12, fig.width=9}
+covidcast_county %>%
+  select(-starts_with("chr_")) %>%
+  group_by(fips) %>%
+  nest() %>% ungroup() %>%
+  #sample_n(1) %>%
+  filter(fips == "36061") %>%
+  unnest(data) %>%
+  # dplyr::mutate(
+  #   value_jhu_csse_smoothed_confirmed_incidence_num = loess(
+  #     formula = value_jhu_csse_confirmed_incidence_num ~ as.numeric(date), data = .,
+  #     span = 0.75) %>%
+  #       predict(newdata = as.numeric(seq(min(date), max(date), by="day")))) %>%
+  pivot_longer(cols = c(-fips, -date), names_to ="metric", values_to = "value") %>%
+  group_by(metric) %>%
+  filter(!all(is.na(value))) %>%
+  arrange(date) %>%
+  filter(!is.na(date) & !is.na(value)) %>%
+  ggplot(aes(date, value)) +
+  geom_line() + ggtitle("New York County") +
+  facet_wrap(vars(metric), scales = "free_y", ncol = 3)
+```
+
+This plots give us an idea of the date ranges of the various signals and the shape of the time series.
+
+### Cross-county mean correlations
+
+We take the mean values across all dates (ignoring NA values) for every measure and for every county and examine the correlations in these averages across counties.
+
+```{r fig.height=9, fig.width=9}
+
+county_party <-
+  read_csv("https://dataverse.harvard.edu/api/access/datafile/3641280?format=original&gbrecs=true") %>%
+  mutate(fips = str_pad(FIPS, 5, side = "left", "0")) %>%
+  group_by(fips, chr_party = party) %>% summarise_at(vars(candidatevotes), sum) %>%
+  filter(candidatevotes == max(candidatevotes)) 
+
+() %>%
+  select(-fips, -chr_name) %>%
+  select(-starts_with("chr_")) %>%
+  cor(method = "spearman", use = "pairwise.complete.obs") %>%
+  ggcorrplot::ggcorrplot(type = "lower", hc.order = TRUE) +
+  theme(legend.position = "none") -> p
+plotly::ggplotly(p)
+```
+
+#### Covariate correlations
+
+```{r fig.height=9, fig.width=9}
+county_means %>% select(-fips, -chr_name, -chr_party) %>%
+  cor(method = "spearman", use = "pairwise.complete.obs") %>%
+  ggcorrplot::ggcorrplot(type = "lower", hc.order = TRUE) +
+  theme(axis.text.y = element_blank(), axis.text.x = element_blank(),
+        axis.ticks = element_blank()) +
+  theme(legend.position = "none") -> p
+plotly::ggplotly(p)
+```
+
+### Survey coverage
+
+```{r}
+county_means %>%
+  select(-starts_with("value_jhu")) %>%
+  gather(metric, value, -starts_with("chr_"), -fips) %>%
+  group_by(metric) %>%
+  summarise(missing_counties = mean(is.na(value))) %>%
+  ggplot(aes(metric, missing_counties)) + geom_col() + coord_flip()
+```
+
+```{r}
+county_means %>%
+  select(-starts_with("value_jhu")) %>%
+  gather(metric, value, -starts_with("chr_"), -fips) %>%
+  group_by(metric, missing_county = !is.na(value)) %>%
+  summarise(missing_pop = sum(chr_population, na.rm = TRUE)) %>%
+  spread(missing_county, missing_pop) %>%
+  mutate(pop_covered = `TRUE` / (`TRUE` + `FALSE`)) %>%
+  arrange(desc(pop_covered)) %>%
+  ggplot(aes(metric, pop_covered)) +
+  geom_col() + coord_flip()
+```
+
+## The right model
+
+Borrowing from Hal's model specification:
+
+$log(cases) = log(\frac{yes}{yes + no} \times population) = log(yes) - log({yes + no}) + log(population)$
+
+We estimate this specification across a few of the survey metrics examined above:
+
+```{r}
+(mdl_spec <- lm(log(value_jhu_csse_confirmed_incidence_num + 1) ~
+     log(value_google_survey_raw_cli) +
+       log(sample_size_google_survey_raw_cli) +
+     log(chr_population), 
+   data = county_means %>%
+     mutate(value_google_survey_raw_cli =
+              value_google_survey_raw_cli * 0.01 * sample_size_google_survey_raw_cli) %>%
+     column_to_rownames("fips")
+     )) %>% summary()
+```
+
+```{r}
+tibble(fitted = mdl_spec$fitted.values, actual = mdl_spec$model[,1],
+       population = mdl_spec$model[,4],
+       fips = rownames(mdl_spec$model)) %>%
+  left_join(county_party, by = "fips") %>%
+  ggplot(aes(actual, fitted, label = fips)) +
+  geom_point(aes(color = population)) + 
+  geom_smooth(method = "lm") -> p
+plotly::ggplotly(p)
+```
+
+If we were to be less thoughtful about our model specification:
+
+```{r}
+(mdl_spec <- lm(value_jhu_csse_confirmed_incidence_prop ~
+     value_google_survey_raw_cli,
+   data = county_means)) %>% summary()
+```
+
+```{r}
+tibble(fitted = mdl_spec$fitted.values, actual = mdl_spec$model[,1],
+       names = rownames(mdl_spec$model)) %>%
+  ggplot(aes(actual, fitted, label=names)) +
+  geom_point() + geom_smooth(method = "lm") -> p
+plotly::ggplotly(p)
+```
+
+## Individual vs Community surveying
+
+Using the optimal model from above we examine the relationship between different mediums of surveyed incidence and actual incidence across counties.
+
+Starting with `fb_survey_raw_cli`:
+
+```{r}
+(mdl_spec <- lm(log(value_jhu_csse_confirmed_incidence_num + 1) ~
+     log(value_fb_survey_raw_cli + 1) + log(sample_size_fb_survey_raw_cli + 1) +
+     log(chr_population + 1),
+   data = county_means %>% column_to_rownames("chr_name"))) %>% summary()
+```
+
+```{r}
+tibble(fitted = mdl_spec$fitted.values, actual = mdl_spec$model[,1],
+       names = rownames(mdl_spec$model)) %>%
+  ggplot(aes(actual, fitted, label=names)) +
+  geom_point() + geom_smooth(method = "lm") -> p
+plotly::ggplotly(p)
+```
+
+Using the individual survey signal we see a relationship, but not as strong as the Google survey.
+
+`value_fb_survey_raw_hh_cmnty_cli`:
+
+In response to the strong signal from the Google survey, the team at CMU Delphi added a Facebook survey that asks the question about the community instead of the individual.
+
+```{r}
+(mdl_spec <- lm(log(value_jhu_csse_confirmed_incidence_num + 1) ~
+     log(value_fb_survey_raw_hh_cmnty_cli + 1) + log(sample_size_fb_survey_raw_hh_cmnty_cli + 1) +
+     log(chr_population + 1),
+   data = county_means %>% column_to_rownames("chr_name"))) %>% summary()
+```
+
+```{r}
+tibble(fitted = mdl_spec$fitted.values, actual = mdl_spec$model[,1],
+       names = rownames(mdl_spec$model)) %>%
+  ggplot(aes(actual, fitted, label=names)) +
+  geom_point() + geom_smooth(method = "lm") -> p
+plotly::ggplotly(p)
+```
+
+The fit significantly improves.
+
+`value_fb_survey_raw_nohh_cmnty_cli`:
+
+There was also a version of this survey where they explicitly ask about the community and not the household.
+
+```{r}
+(mdl_spec <- lm(log(value_jhu_csse_confirmed_incidence_num + 1) ~
+     log(value_fb_survey_raw_nohh_cmnty_cli + 1) + log(sample_size_fb_survey_raw_nohh_cmnty_cli + 1) +
+     log(chr_population + 1),
+   data = county_means %>% column_to_rownames("chr_name"))) %>% summary()
+```
+
+```{r}
+tibble(fitted = mdl_spec$fitted.values, actual = mdl_spec$model[,1],
+       names = rownames(mdl_spec$model)) %>%
+  ggplot(aes(actual, fitted, label=names)) +
+  geom_point() + geom_smooth(method = "lm") -> p
+plotly::ggplotly(p)
+```
+
+This seems to fit slightly better.
+
+## Modeling cases to deaths
+
+First predict cases from `value_google_survey_raw_cli`:
+
+```{r}
+(mdl_spec <- lm(log(value_jhu_csse_confirmed_incidence_num + 1) ~
+     log(value_google_survey_raw_cli) + log(sample_size_google_survey_raw_cli) +
+     log(chr_population),
+   data = readd(covidcast_chr_county_means) %>% 
+     column_to_rownames("chr_name"))) %>% summary()
+cases_preds <- mdl_spec$fitted.values
+```
+
+Then use fitted values to predict deaths:
+
+```{r}
+# county_means_deaths <- county_means %>%
+#   left_join(data.frame(fitted_confirmed = cases_preds) %>%
+#               rownames_to_column("chr_name"),
+#             by = "chr_name") %>%
+#   select(-fips, -starts_with("value_"), -starts_with("sample_size"),
+#          value_jhu_csse_deaths_incidence_num) %>%
+#   filter(!is.na(fitted_confirmed) &
+#            !is.na(value_jhu_csse_deaths_incidence_num)) %>%
+#   select_if(~ mean(!is.na(.x)) ==1) %>%
+#   column_to_rownames("chr_name")
+
+(mdl_spec <- lm(log(value_jhu_csse_deaths_incidence_num + 1) ~
+     fitted_confirmed + chr_population,
+     data = readd(covidcast_chr_county_means) %>% 
+       left_join(tibble(fitted_confirmed = cases_preds) %>%
+                   rownames_to_column("chr_name"),
+                 by = "chr_name") %>%
+       column_to_rownames("chr_name") %>%
+       bind_rows())) %>% summary()
+```
+
+```{r}
+tibble(fitted = mdl_spec$fitted.values, actual = mdl_spec$model[,1],
+       names = rownames(mdl_spec$model)) %>%
+  ggplot(aes(actual, fitted, label=names)) +
+  geom_point() + geom_smooth(method = "lm") -> p
+plotly::ggplotly(p)
+```
+
+Layer on "intuitive" covariates:
+
+```{r}
+(mdl_spec <- lm(log(value_jhu_csse_deaths_incidence_num + 1) ~
+     fitted_confirmed + chr_pct_pop_65_and_older,
+     data = county_means_deaths)) %>% summary()
+```
+
+```{r}
+tibble(fitted = mdl_spec$fitted.values, actual = mdl_spec$model[,1],
+       names = rownames(mdl_spec$model)) %>%
+  ggplot(aes(actual, fitted, label=names)) +
+  geom_point() + geom_smooth() -> p
+plotly::ggplotly(p)
+```
+
+Prediction improves when controlling for an elderly population.
+
+```{r}
+mdl_spec <- BoomSpikeSlab::lm.spike(
+  log(value_jhu_csse_deaths_incidence_num + 1) ~ .,
+  data = county_means_deaths, niter = 10000)
+summary(mdl_spec)$rsquare
+```
+```{r}
+plot(mdl_spec, "inclusion", inclusion.threshold = 0.5)
+```
+
+```{r}
+tibble(fitted = predict(mdl_spec, mean.only = TRUE),
+       actual = mdl_spec$response,
+       names = rownames(county_means_deaths)) %>%
+  ggplot(aes(actual, fitted, label=names)) +
+  geom_point() + geom_smooth(method = "lm") -> p
+plotly::ggplotly(p)
+```
+
+## Population data
+
+```{r}
+#tidycensus::census_api_key("8900c6e43b36c7974e390b41e93fc60a974afd8f", install = TRUE)
+pop_dat <- county_means %>%
+  mutate(fips = as.numeric(fips)) %>%
+  left_join(read_csv("https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/csse_covid_19_data/csse_covid_19_time_series/time_series_covid19_deaths_US.csv") %>%
+              select(fips = FIPS, jhu_pop = Population), by = "fips") %>%
+  left_join(tidycensus::get_estimates("county", "population", year = 2018) %>%
+              spread(variable, value) %>%
+              mutate(fips = as.numeric(GEOID)) %>%
+              select(fips, census_pop = POP, census_density = DENSITY)) %>%
+  mutate(jhu_diff = (jhu_pop - census_pop) / census_pop,
+         chr_diff = (chr_population - census_pop) / census_pop)
+
+pop_dat %>%
+  arrange(desc(abs(chr_diff)), desc(abs(jhu_diff))) %>%
+  select(fips, chr_name, chr_population, jhu_pop, census_pop, chr_diff,
+         jhu_diff)
+  
+pop_dat %>% filter(abs(jhu_diff) < 4) %>% ggplot(aes(jhu_diff)) + geom_density()
+```
+
+There's a discrepancy with the JHU population data compared to County Health Rankings and the Census but it's not clearly consistent. New York county is off by a large factor largely due to differences in accounting for boroughs but everything else seems to differ largely in the single digit percentage difference but nothing uniformly consistent.
+
+## Political over/undercounting?
+
+We suspect that cases are not uniformly measured across counties in the US but perhaps the google surveys are a better measure of incidence vs the actual measured incidence.  We can explore this phenomena to see if there are differences between the relationship between survey incidence and measured incidence for democrat vs republican counties.
+
+```{r}
+(mdl_spec <- lm(log(value_jhu_csse_confirmed_incidence_num + 1) ~
+     log(value_google_survey_raw_cli + 1) * chr_party +
+       log(sample_size_google_survey_raw_cli + 1) * chr_party +
+     log(chr_population), 
+   data = county_means %>%
+     mutate(value_google_survey_raw_cli =
+              value_google_survey_raw_cli * 0.01 * sample_size_google_survey_raw_cli) %>%
+     column_to_rownames("chr_name")
+     )) %>% summary()
+
+```
+
+In this case we think the fitted value is the actual valu
+
+```{r}
+tibble(fitted = mdl_spec$fitted.values, actual = mdl_spec$model[,1],
+       chr_name = rownames(mdl_spec$model),
+       party = fct_relevel(mdl_spec$model$chr_party, "republican")) %>%
+  ggplot(aes(actual, fitted, label = chr_name,
+             color = party)) +
+  geom_point() + 
+  geom_smooth(method = "lm") -> p
+plotly::ggplotly(p)
+```
+
+```{r}
+(mdl_spec <- lm(log(value_google_survey_raw_cli + 1) ~
+     log(value_jhu_csse_confirmed_incidence_num + 1) * chr_party +
+       log(sample_size_google_survey_raw_cli + 1) * chr_party +
+     log(chr_population + 1), 
+   data = county_means %>%
+     mutate(value_google_survey_raw_cli =
+              value_google_survey_raw_cli * 0.01 * sample_size_google_survey_raw_cli) %>%
+     column_to_rownames("chr_name")
+     )) %>% summary()
+```
+
+```{r}
+tibble(fitted = mdl_spec$fitted.values, actual = mdl_spec$model[,1],
+       chr_name = rownames(mdl_spec$model),
+       party = fct_relevel(mdl_spec$model$chr_party, "republican")) %>%
+  ggplot(aes(actual, fitted, label = chr_name,
+             color = party)) +
+  geom_point() + 
+  geom_smooth(method = "lm") -> p
+plotly::ggplotly(p)
+```
+
+```{r}
+(mdl_spec <- lm(log(value_google_survey_raw_cli + 1) ~
+     log(value_jhu_csse_deaths_incidence_num + 1) * chr_party +
+       log(sample_size_google_survey_raw_cli + 1) * chr_party +
+     log(chr_population + 1),
+   data = county_means %>%
+     mutate(value_google_survey_raw_cli =
+              value_google_survey_raw_cli * 0.01 * sample_size_google_survey_raw_cli) %>%
+     column_to_rownames("chr_name")
+     )) %>% summary()
+```
+
+```{r}
+tibble(fitted = mdl_spec$fitted.values, actual = mdl_spec$model[,1],
+       chr_name = rownames(mdl_spec$model),
+       party = fct_relevel(mdl_spec$model$chr_party, "republican")) %>%
+  ggplot(aes(actual, fitted, label = chr_name,
+             color = party)) +
+  geom_point() + 
+  geom_smooth(method = "lm") -> p
+plotly::ggplotly(p)
+```

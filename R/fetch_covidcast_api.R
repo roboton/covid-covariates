@@ -7,7 +7,7 @@
 ##' @return
 ##' @author roboton
 ##' @export
-fetch_covidcast <- function() {
+fetch_covidcast_api <- function() {
   metadata <- fromJSON(
     "https://delphi.cmu.edu/epidata/api.php?source=covidcast_meta") 
   
@@ -32,14 +32,13 @@ fetch_covidcast <- function() {
 }
 
 # dependencies
-source(
-  "https://raw.githubusercontent.com/cmu-delphi/delphi-epidata/master/src/client/delphi_epidata.R")
+source(paste0(
+  "https://raw.githubusercontent.com",
+  "/cmu-delphi/delphi-epidata/master/src/client/delphi_epidata.R"))
 
 # function to process a single api call
 fetch_delphi <- function(
   source, data_source, signal, time_type, geo_type, time_values, geo_value) {
-  # print(paste(source, data_source, signal, time_type, geo_type, time_values,
-  #             geo_value))
   res <- Epidata[["covidcast"]](data_source, signal, time_type, geo_type,
                                 list(time_values), geo_value)
   # result had an error

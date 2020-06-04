@@ -1,0 +1,236 @@
+---
+title: "COVID prediction - timeseries"
+author: "Robert On, Hal Varian"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_notebook:
+    code_folding: hide
+---
+
+```{r setup}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+library(drake)
+library(tidyverse)
+library(lubridate)
+```
+
+# Methods
+
+The purpose of this notebook is to explore different timeseries/panel prediction methods in estimating US county-level COVID cases and deaths.
+
+# Available time series
+
+```{r}
+readd(covidcast_daily)
+readd(google_mob_agg)
+```
+
+Time spans for each time series:
+
+```{r}
+(tspans <- readd(covidcast_daily) %>%
+  filter(geo_type == "county") %>%
+  group_by(signal, data_source) %>%
+  arrange(date) %>%
+  summarise(min_date = min(date, na.rm = TRUE),
+            max_date = max(date, na.rm = TRUE)) %>%
+  gather(date_type, date, -signal, -data_source) %>%
+  ungroup() %>%
+  mutate(signal = paste(signal, data_source))) %>%
+  ggplot(aes(date, signal, color = data_source)) +
+  geom_line(size = 3)
+
+tspans %>% spread(date_type, date)
+```
+
+```{r}
+cov_ts <- readd(covidcast_daily) %>%
+  select(-source, -direction, -stderr, -sample_size, -time_type) %>%
+  filter(!is.na(date) & !is.na(value)) %>%
+  unite(signal, data_source, signal) %>%
+  left_join(readd(county_health_join), by = c("geo_value" = "fips5"),
+            suffix = c("", ".chr"))
+```
+
+### Lagged correlations
+
+```{r message=FALSE, warning=FALSE}
+ts_cors <- function(lt = 7, case_thresh = 1, death_thresh = 1) {
+  lag_dat <- cov_ts %>%
+    # filter to counties
+    filter(geo_type == "county") %>%
+    #filter("2020-04-11") %>% # when google-survey starts
+    # group_by(signal, geo_value, date = floor_date(date, "week")) %>%
+    # summarise(value = mean(value)) %>% 
+    # group_by(geo_value) %>%
+    # filter(any(str_detect(signal, "google"))) %>%
+    # ungroup() %>%
+    #filter(geo_value %in% sample(unique(geo_value), 1)) %>%
+    #filter(geo_value == "34017") %>%
+    # filter(!str_detect(signal, "(cumulative)|(raw)|(prop)"))  %>%
+  
+    # lag non-jhu by lt number of days
+    group_by(geo_value, signal) %>%
+    mutate(value = if_else(
+      str_detect(signal, "jhu"), value,
+      if(lt >= 0) lag(value, lt) else lead(value, -1 * lt))) %>%
+    ungroup() %>%
+    # spread out signals
+    spread(signal, value) %>%
+    group_by(geo_value) %>%
+    # filter out counties with no cases
+    # TODO(robon): do we want to pick up cli without cases?
+    filter(any(`jhu-csse_confirmed_incidence_num` > 0) &
+             any(`jhu-csse_deaths_incidence_num` > 0)) %>%
+    # get date of first death and first case per county
+    mutate(
+      first_case_date = min(
+        date[`jhu-csse_confirmed_incidence_num` >= case_thresh], na.rm = TRUE),
+      first_death_date = if_else(
+        all(`jhu-csse_deaths_incidence_num` == 0), NA_Date_,
+        min(date[`jhu-csse_deaths_incidence_num` >= death_thresh], na.rm = TRUE))
+      ) %>%
+    # drop dates more than two weeks before and after first case or death
+    filter(date >= min(c(first_death_date - days(14), first_case_date - days(14)),
+                       na.rm = TRUE) &
+             date <= max(c(first_death_date + days(14), first_case_date + days(14)),
+                         na.rm = TRUE)) %>%
+    ungroup() %>%
+    select_if(is.numeric) %>%
+    select(-contains("_raw"), -starts_with("chr_")) %>%
+    corrr::correlate(., use = "pairwise.complete.obs", method = "pearson") %>%
+    corrr::focus(starts_with("jhu-csse")) %>%
+    mutate(lag = lt)
+}
+
+lag_dat <- map_df(-14:14, ts_cors) %>% bind_rows()
+```
+
+```{r fig.height=8}
+lag_dat %>%
+  select(rowname, lag, everything()) %>%
+  #select(1:2, 3, 6) %>%
+  gather(metric, value, -rowname, -lag) %>%
+  ggplot(aes(lag, value, color = rowname)) +
+  geom_line() + facet_wrap(vars(metric), ncol = 4) +
+  xlab("days ahead") + ylab("correlation") +
+  annotate("rect", xmin=-Inf, xmax=0, ymin=-Inf, ymax=Inf, alpha = 0.1) +
+  annotate("rect", xmin=-Inf, xmax=Inf, ymin=-Inf, ymax=0, fill = "pink", alpha = 0.1)
+```
+
+### BSTS
+
+Here we run the BSTS model with a local linear trend along with a day-of-week seasonality effect to predict case counts along with the help of our survey measures.
+
+```{r message=FALSE, warning=FALSE}
+bsts_mdls <- cov_ts %>%
+  filter(geo_type == "county") %>%
+  pivot_wider(names_from = signal, values_from = value) %>%
+  select(-geo_type, fips = geo_value) %>%
+  filter(complete.cases(.)) %>%
+  #filter(fips == sample(unique(fips), 1)) %>%
+  #filter(fips == "12105") %>%
+  group_by(fips) %>%
+  filter(var(`jhu-csse_confirmed_incidence_num`) != 0) %>%
+  select(-starts_with("jhu-csse"), `jhu-csse_confirmed_incidence_num`) %>%
+  nest() %>% ungroup() %>%
+  mutate(bsts_mdl = map(data, function(x) {
+    bsts::bsts(`jhu-csse_confirmed_incidence_num` ~ . - date,
+           state.specification =
+             bsts::AddLocalLinearTrend(
+               list(), x$`jhu-csse_confirmed_incidence_num`) %>%
+             bsts::AddSeasonal(x$`jhu-csse_confirmed_incidence_num`,
+                               nseasons = 7),
+           data = x, niter = 10000)
+  }))
+```
+
+The Spike-and-slab prior on predictors allow us to compute an inclusion probability for each of the predictors in the model:
+
+```{r}
+bsts_mdls %>% pull(bsts_mdl) %>%
+  map_dfr(~ .x[["coefficients"]] %>% as_tibble()) %>%
+  summarise_all(~ mean(.x != 0)) %>%
+  gather(predictor, inclusion_probability) %>%
+  arrange(desc(inclusion_probability))
+```
+
+Here we see that `google-survey_raw_cli` is the most significant but all of them don't contribute much reflected in their inclusion probabilities around 1%.
+
+```{r}
+bsts_mdls %>%
+  mutate(rsquare = map_dbl(bsts_mdl, ~ summary(.)$rsquare)) %>%
+  ggplot(aes(rsquare)) + geom_histogram(bins = 50)
+```
+
+The distribution of $r^2$ varies quite a lot across counties. Pretty much all of it is explained from the local linear trend.
+
+### Panel data with fixed effects
+
+Here we try a panel data approach with county fixed effects to be able to take advantage of variation across counties as well as over time. We aggregate the counts on a weekly basis here to smooth out some of the noise.
+
+```{r message=FALSE, warning=FALSE}
+panel_dat <- cov_ts %>%
+  spread(signal, value) %>%
+  select(-geo_type) %>%
+  mutate(date = floor_date(date, "week")) %>%
+  group_by(date, geo_value) %>%
+  summarise_all(sum, na.rm = TRUE) %>%
+  rename(cases = `jhu-csse_confirmed_incidence_num`) %>%
+  group_by(geo_value) %>%
+  filter(!all(cases == 0)) %>%
+  arrange(date) %>%
+  mutate(
+    cases = if_else(cases < 0, 0, cases),
+    cases_lag = lag(cases),
+    first_case_date = min(date[cases > 0]),
+    days_since = date - first_case_date) %>%
+  ungroup() %>%
+  filter(complete.cases(.)) %>%
+  tibble(.name_repair = "universal") %>%
+  select(-date, -first_case_date, -starts_with("jhu.")) %>%
+  plm::pdata.frame(index = c("geo_value"))
+```
+
+Our simplest model simply uses last week's cases and the number of days since the first case.  This allows the level set from the previous time period and a linear trend
+
+```{r}
+panel_lag_cases <- plm::plm(cases ~ cases_lag + days_since, data = panel_dat,
+                            model = "random")
+
+panel_lag0 <- plm::plm(cases ~ cases_lag +
+           lag(doctor.visits_smoothed_adj_cli, 0) +
+           lag(fb.survey_smoothed_cli, 0) +
+           lag(google.survey_smoothed_cli, 0) +
+           lag(indicator.combination_nmf_day_doc_fbs_ght, 0),
+         data = panel_dat, model = "random")
+
+panel_lag1 <- plm::plm(cases ~ cases_lag +
+           lag(doctor.visits_smoothed_adj_cli, 1) +
+           lag(fb.survey_smoothed_cli, 1) +
+           lag(google.survey_smoothed_cli, 1) +
+           lag(indicator.combination_nmf_day_doc_fbs_ght, 1),
+         data = panel_dat, model = "random")
+
+bind_rows(
+  panel_lag_cases %>% broom::glance(),
+  panel_lag0 %>% broom::glance(),
+  panel_lag1 %>% broom::glance()) %>%
+  mutate(model = c("base", "+survey", "+lagged survey")) %>%
+  select(model, r.squared)
+```
+
+Again we don't see much evidence of added predictive power from the surveys.
+
+## Reproducibility
+
+```{r}
+## datetime
+Sys.time() 
+
+## repository
+git2r::repository()
+
+## session info
+sessionInfo()
+```

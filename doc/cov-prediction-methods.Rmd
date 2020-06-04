@@ -1,0 +1,364 @@
+---
+title: "COVID prediction - methods"
+author: "Robert On, Hal Varian"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_notebook:
+    code_folding: hide
+---
+
+# Methods
+
+The purpose of this notebook is to explore different prediction methods in estimating US county-level COVID cases and deaths.
+
+## Prediction
+
+We create a 75/25 training and test set from our imputed counties data.
+
+```{r}
+train_set <- readd(train_set)
+test_set <- readd(test_set)
+
+bind_rows(
+  summarise_all(train_set, mean) %>% mutate(set = "train"),
+  summarise_all(test_set, mean) %>% mutate(set = "test")
+) %>% gather(var, value, -set)
+```
+
+### Random Forest
+
+We first try random forests via the `ranger` package:
+
+```{r}
+iris_ranger <- rand_forest(trees = 100, mode = "classification") %>%
+  set_engine("ranger") %>%
+  fit(Species ~ ., data = train_set)
+```
+
+
+```{r}
+set.seed(1001)
+ranger_mdl <- ranger(
+  jhu_csse_confirmed_incidence_num ~ ., mtry = 1j,
+  data = train_set[,c(1:201, 216)], importance = "impurity")
+
+ranger_mdl$r.squared %>% setNames("r-square")
+```
+
+```{r}
+sort(importance(ranger_mdl), decreasing = TRUE) %>% head(10)
+```
+
+Many of the CMU data sources are described to have the most predictive power as well as a few county covariates and mobility measures.
+
+One nice property of tree-based methods are allowing for non-linear relationships across the support of a predictor. Below are the partial dependence plots of the top 10 predictors.
+
+```{r}
+# sort(importance(ranger_mdl), decreasing = TRUE) %>% head(4) %>%
+#   names() %>%
+#   map(~ partial(ranger_mdl, pred.var = .x, plot = TRUE))
+top_vars <- importance(ranger_mdl) %>% sort %>% tail(3) %>% names()
+
+lapply(top_vars, FUN = function(x) {
+  ranger_mdl %>%
+    partial(pred.var = x, train = train_set) %>%
+    plotPartial()
+})
+```
+
+What about performance on the test set?
+
+```{r}
+y_test <- test_set$jhu_csse_confirmed_incidence_prop
+preds <- predict(ranger_mdl, data = test_set)$predictions
+
+plot(y_test, preds)
+abline()
+1 -sum((preds - y_test)^2)/sum((y_test - mean(y_test))^2) %>%
+  setNames("r-square")
+```
+
+### Spike-and-slab
+
+```{r results="hide"}
+set.seed(823)
+ss_iters <- 10000
+ss_mdl <- lm.spike(
+  jhu_csse_confirmed_incidence_prop ~ . - jhu_csse_deaths_incidence_prop,
+  data = train_set, niter = ss_iters)
+```
+
+```{r}
+summary(ss_mdl)$rsquare["Mean"] %>% setNames("r-square")
+```
+
+```{r}
+plot(ss_mdl, "scaled.coefficients", inclusion.threshold = 0.45)
+```
+
+Let's check test set performance:
+
+```{r}
+y_test <- test_set$jhu_csse_confirmed_incidence_prop
+preds <- predict(ss_mdl, newdata = test_set, mean.only = TRUE)
+
+plot(y_test, preds)
+1 - sum((preds - y_test)^2)/sum((y_test - mean(y_test))^2) %>%
+  setNames("r-square")
+```
+
+### SuperLearner
+
+SuperLearner is an ensemble approach that combines and weights multiple machine learning algorithms. In this case we will be using a basic mean estimator, elastic net, random forests, bayesian additive regression trees, xg-boost, and support vector machines.
+
+```{r}
+# options(mc.cores = RhpcBLASctl::get_num_cores())
+# set.seed(247, "L'Ecuyer-CMRG")
+
+y_train <- train_set$jhu_csse_confirmed_incidence_prop
+x_train <- train_set %>% select(-starts_with("jhu_csse_"))
+sl_lib <- c("SL.mean", "SL.glmnet", "SL.ranger", #"SL.bartMachine",
+            "SL.svm", "SL.xgboost")
+
+sl_mdl <- SuperLearner(Y = y_train, X = x_train, family = gaussian(),
+                       SL.library = sl_lib)
+1 - sum((sl_mdl$SL.predict - y_train)^2)/sum((y_train - mean(y_train))^2)
+```
+
+
+```{r}
+y_test <- test_set$jhu_csse_confirmed_incidence_prop
+x_test <- test_set %>% select(-starts_with("jhu_csse_"))
+
+preds <- SuperLearner::predict.SuperLearner(sl_mdl, newdata = x_test,
+                                            onlySL = TRUE)$pred
+plot(preds, y_test)
+1 - sum((preds - y_test)^2)/sum((y_test - mean(y_test))^2) %>%
+  setNames("r-square")
+```
+
+`CV.SuperLearner` provides a more honest estimate of performance by doing cross-validation across multiple calls to `SuperLearner`. It doesn't return an actual model though, so we can't run out of sample test performance with it.
+
+```{r}
+cvsl_mdl <- CV.SuperLearner(Y = y_train, X = x_train, family = gaussian(),
+                           V = 10,
+                           #parallel = "multicore",
+                           SL.library = sl_lib)
+1 - sum((cvsl_mdl$SL.predict - y_train)^2)/sum((y_train - mean(y_train))^2)
+```
+
+Model importance is `SuperLearner`s version of variable importance:
+
+```{r}
+plot(cvsl_mdl) + theme_bw()
+```
+
+#### Tuned hyper-parameters
+
+```{r}
+mtry_seq <- round(c(0.5, 1, 2) * sqrt(ncol(train_set)))
+trees_seq <- c(100, 500, 1000)
+```
+
+```{r}
+learners <- create.Learner("SL.ranger", tune = list(mtry = mtry_seq,
+                                                    num.trees = trees_seq))
+```
+
+```{r}
+cvsl_mdl_tuned <- CV.SuperLearner(Y = y_train, X = x_train, family = gaussian(),
+                                  V = 10,
+                                  #parallel = "multicore",
+                                  SL.library = c(sl_lib, learners$names))
+1 - sum((cvsl_mdl_tuned$SL.predict - y_train)^2)/sum((y_train - mean(y_train))^2)
+```
+
+```{r}
+plot(cvsl_mdl_tuned) + theme_bw()
+```
+
+### Sparse SuperLearner
+
+This wide divergence between training and test/cross-validated fit could be due to overfitting. There are many knobs to help address this in the underlying methods in the SuperLearner ensemble, but what if we simply tried fewer predictors?
+
+In the data set below we drop the mobility covariates, as well as aggregate the county health ranking covariates into 5 covariates.
+
+```{r}
+train_set_sparse <- readd(train_set)
+test_set_sparse <- readd(test_set)
+
+bind_rows(
+  summarise_all(train_set_sparse, mean) %>% mutate(set = "train"),
+  summarise_all(test_set_sparse, mean) %>% mutate(set = "test")
+)
+```
+
+```{r}
+y_train_sparse <- train_set_sparse$jhu_csse_confirmed_incidence_prop
+x_train_sparse <- train_set_sparse %>% select(-starts_with("jhu_csse_"))
+sl_lib <- c("SL.mean", "SL.glmnet", "SL.ranger", #"SL.bartMachine",
+            "SL.svm", "SL.xgboost")
+
+sl_mdl_sparse <- SuperLearner(Y = y_train_sparse, X = x_train_sparse,
+                              family = gaussian(), SL.library = sl_lib)
+1 - sum((sl_mdl_sparse$SL.predict - y_train_sparse)^2) /
+  sum((y_train_sparse - mean(y_train_sparse))^2)
+```
+
+
+```{r}
+y_test_sparse <- test_set_sparse$jhu_csse_confirmed_incidence_prop
+x_test_sparse <- test_set_sparse %>% select(-starts_with("jhu_csse_"))
+
+preds_sparse <- predict.SuperLearner(sl_mdl_sparse, newdata = x_test_sparse,
+                                     onlySL = TRUE)$pred
+plot(preds_sparse, y_test_sparse)
+1 - sum((preds_sparse - y_test_sparse)^2) /
+  sum((y_test_sparse - mean(y_test_sparse))^2) %>% setNames("r-square")
+```
+
+`CV.SuperLearner` provides a more honest estimate of performance by doing cross-validation across multiple calls to `SuperLearner`. It doesn't return an actual model though, so we can't run out of sample test performance with it.
+
+```{r}
+cvsl_sparse_mdl <- CV.SuperLearner(
+  Y = y_train_sparse, X = x_train_sparse, family = gaussian(), V = 10,
+  #parallel = "multicore",
+  SL.library = sl_lib, verbose = TRUE)
+1 - sum((cvsl_sparse_mdl$SL.predict - y_train_sparse)^2) /
+  sum((y_train_sparse - mean(y_train_sparse))^2)
+```
+
+Model importance is `SuperLearner`s version of variable importance:
+
+```{r}
+plot(cvsl_sparse_mdl) + theme_bw()
+```
+
+In absolute terms, the $r^2$ values are closer to each other but proportionally not very different than what we saw with the model with a full set of covariates.
+
+### Tuned Random Forests
+
+#### Cases
+
+```{r}
+county_joined_clean <- readd(county_joined_all) %>%
+  rename_all(~ str_remove(.x, "(_percent_change_from_baseline)|( raw value)") %>%
+               str_to_lower()) %>%
+  rename_all(~ str_replace_all(.x, c(" " = "_", "\\._" = "_", "&" = "and",
+                                     "-" = "_", "\\/" = "_")) %>%
+               str_to_lower()) %>%
+  mutate_if(is.Date, as.numeric) %>%
+  mutate_if(is.difftime, as.numeric) %>%
+  mutate_if(is.character, as.factor) %>%
+  filter_at(vars(starts_with("jhu_csse")), ~ !is.na(.x)) %>%
+  select(-starts_with("jhu_csse_"), jhu_csse_confirmed_incidence_prop)
+             
+county_joined_split <- initial_split(county_joined_clean, prop = 3/4)
+
+# extract training and testing sets
+train_set <- training(county_joined_split)
+test_set <- testing(county_joined_split)
+train_cv <- vfold_cv(train_set)
+
+cov_recipe <- county_joined_clean %>%
+  recipe(jhu_csse_confirmed_incidence_prop ~ .) %>%
+           # jhu_csse_deaths_incidence_num +
+           # jhu_csse_deaths_cumulative_num +
+           # jhu_csse_confirmed_incidence_prop +
+           # jhu_csse_confirmed_incidence_num +
+           # jhu_csse_confirmed_cumulative_num ~ .) %>%
+  step_knnimpute(all_predictors())
+
+rf_model <- rand_forest() %>%
+  set_args(mtry = tune(), trees = tune()) %>%
+  set_engine("ranger") %>%
+  set_mode("regression")
+
+cov_workflow <- workflows::workflow() %>%
+  add_recipe(cov_recipe) %>%
+  add_model(rf_model)
+
+rf_grid <- expand.grid(mtry = round(c(0.5, 1, 1.5) * sqrt(ncol(train_set))),
+                       trees = c(100, 500, 1000))
+
+rf_tune_results <- cov_workflow %>%
+  tune_grid(resamples = train_cv,
+            grid = rf_grid,
+            metrics = metric_set(rmse, rsq))
+
+rf_tune_results %>%
+  collect_metrics()
+
+param_final <- rf_tune_results %>%
+  select_best(metric = "rsq")
+param_final
+```
+
+#### Deaths
+
+```{r}
+county_joined_clean <- readd(county_joined_all) %>%
+  rename_all(~ str_remove(.x, "(_percent_change_from_baseline)|( raw value)") %>%
+               str_to_lower()) %>%
+  rename_all(~ str_replace_all(.x, c(" " = "_", "\\._" = "_", "&" = "and",
+                                     "-" = "_", "\\/" = "_")) %>%
+               str_to_lower()) %>%
+  mutate_if(is.Date, as.numeric) %>%
+  mutate_if(is.difftime, as.numeric) %>%
+  mutate_if(is.character, as.factor) %>%
+  filter_at(vars(starts_with("jhu_csse")), ~ !is.na(.x)) %>%
+  select(-starts_with("jhu_csse_"), jhu_csse_deaths_incidence_prop)
+             
+county_joined_split <- initial_split(county_joined_clean, prop = 3/4)
+
+# extract training and testing sets
+train_set <- training(county_joined_split)
+test_set <- testing(county_joined_split)
+train_cv <- vfold_cv(train_set)
+
+cov_recipe <- county_joined_clean %>%
+  recipe(jhu_csse_deaths_incidence_prop ~ .) %>%
+           # jhu_csse_deaths_incidence_num +
+           # jhu_csse_deaths_cumulative_num +
+           # jhu_csse_confirmed_incidence_prop +
+           # jhu_csse_confirmed_incidence_num +
+           # jhu_csse_confirmed_cumulative_num ~ .) %>%
+  step_knnimpute(all_predictors())
+
+rf_model <- rand_forest() %>%
+  set_args(mtry = tune(), trees = tune()) %>%
+  set_engine("ranger") %>%
+  set_mode("regression")
+
+cov_workflow <- workflows::workflow() %>%
+  add_recipe(cov_recipe) %>%
+  add_model(rf_model)
+
+rf_grid <- expand.grid(mtry = round(c(0.5, 1, 2) * sqrt(ncol(train_set))),
+                       trees = c(100, 500, 1000))
+
+rf_tune_results <- cov_workflow %>%
+  tune_grid(resamples = train_cv,
+            grid = rf_grid,
+            metrics = metric_set(rmse, rsq))
+
+rf_tune_results %>%
+  collect_metrics()
+
+param_final <- rf_tune_results %>%
+  select_best(metric = "rsq")
+param_final
+```
+
+## Reproducibility
+
+```{r}
+## datetime
+Sys.time() 
+
+## repository
+git2r::repository()
+
+## session info
+sessionInfo()
+```

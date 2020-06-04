@@ -8,12 +8,14 @@
 ##' @return
 ##' @author roboton
 ##' @export
-compute_cpt <- function(.data, model = "meancpt") {
-  .data %>% nest() %>% rowwise() %>%
-    mutate(cpt_mdl = list(envcpt(data$value, models = model,
-                                 verbose = FALSE))) %>%
-    mutate(cpt_params = list(extract_cpt_params(data, cpt_mdl))) %>%
-    unnest(cpt_params) %>% ungroup() %>%
+compute_mobility_cpt <- function(.data, model = "meancpt") {
+  .data %>% 
+    group_by_at(vars(-date, -value)) %>%
+    nest() %>% #rowwise() %>%
+    mutate(cpt_mdl = map(
+      data, possibly(~ envcpt(.x$value, models = model, verbose = FALSE), NA))) %>%
+    mutate(cpt_params = map2(data, cpt_mdl, ~ extract_cpt_params(.x, .y))) %>%
+    unnest(cpt_params) %>% ungroup() %>% select(-cpt_params) %>%
     return()
 }
 

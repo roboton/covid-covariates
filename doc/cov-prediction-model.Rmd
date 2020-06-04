@@ -1,5 +1,5 @@
 ---
-title: "COVID prediction"
+title: "COVID prediction - model"
 author: "Robert On, Hal Varian"
 date: "`r format(Sys.time(), '%d %B, %Y')`"
 output:
@@ -7,215 +7,9 @@ output:
     code_folding: hide
 ---
 
-The purpose of this notebook is to estimate the value of county level covariates towards predicting COVID-related outcomes.
+# Model
 
-## Data description
-
-The data set we're working with is `county_joined_all` which is generated from a `drake` plan. `drake` plans help improve replicability as well as provide improved performance and caching by taking advantage of a DAG-based data dependancy graph. More [here](https://github.com/roboton/covid-covariates).
-![drake plan](cov-sankey.png)
-
-This data set includes outcomes from [JHU CSSE](https://github.com/CSSEGISandData/COVID-19) and predictors from [Google Mobility Reports](https://www.google.com/covid19/mobility/), [County Health Rankings](https://www.countyhealthrankings.org/), and [CMU Delphi COVIDcast](https://cmu-delphi.github.io/delphi-epidata/api/covidcast.html).
-
-### Google Mobility Reports
-
-The list of columns below are parameters from a change point analysis of each county mobility time series. Each mobility time series describes the percent change in mobility from the pre-period (2020-02-15) for six categories of locations: retail/recreation, grocery/pharmacy, parks, transit stations, workplaces and residential.
-
-The change point analysis uses these time series to compute the potential drop in mobility:
-
-- `change_start_date`: when the drop began
-- `change_end_date`: when the change bottomed out
-- `mean_before`: average mobility prior to `change_start_date`
-- `mean_after`: average mobility after `change_end_date`
-- `var_before`: variance in mobility prior to `change_start_date`
-- `var_after`: variance in mobility after `change_end_date`
-- `change_diff`: the difference between `mean_before` and `mean_after`
-- `change_days`: number of days between `change_start_date` and `change_end_date`
-- `change_slope`: pace of change, `change_diff` divided by `change_days`
-- `revert`: difference in mobility between the current period and the lowest period 
-
-More information about these mobility parameters can be found [here](https://ond3.com/cov-mobility.nb.html).
-
-```{r}
-readd(county_joined_all) %>%
-  select(starts_with("mob_")) %>%
-  summarise_all(~ mean(is.na(.x))) %>%
-  gather(predictor, pct_counties_missing) %>%
-  arrange(desc(pct_counties_missing))
-```
-
-We can see here that there are a fair number of missing values in these measures. This is work-in-progress to be improved.
-
-### County Health Rankings
-
-The second set of covariates come from County Health Rankings are are described [here](https://www.countyhealthrankings.org/explore-health-rankings/measures-data-sources/2020-measures). They serve as a set of static descriptors of each county.
-
-```{r}
-readd(county_joined_all) %>%
-  select(starts_with("chr_")) %>%
-  summarise_all(~ mean(is.na(.x))) %>%
-  gather(predictor, pct_counties_missing) %>%
-  arrange(desc(pct_counties_missing))
-```
-
-### CMU Delphi Epidata
-
-The third are a set of potential leading indicators of COVID severity from surveys, doctor visits, and other sources better described [here](https://cmu-delphi.github.io/delphi-epidata/api/covidcast.html).
-
-```{r}
-readd(county_joined_all) %>%
-  select(starts_with("cmu_")) %>%
-  summarise_all(~ mean(is.na(.x))) %>%
-  gather(predictor, pct_counties_missing) %>%
-  arrange(desc(pct_counties_missing))
-```
-
-## Prediction
-
-First we prepare and impute missing data using k-nearest neighbors. Then we produce training and test sets for our data.
-
-```{r}
-train_set <- readd(train_set)
-test_set <- readd(test_set)
-
-bind_rows(
-  summarise_all(train_set, mean) %>% mutate(set = "train"),
-  summarise_all(test_set, mean) %>% mutate(set = "test")
-)
-```
-
-### Random Forest
-
-We first try random forests via the `ranger` package:
-
-```{r}
-set.seed(637)
-ranger_mdl <- ranger(
-  jhu.csse_confirmed_incidence_prop ~ . - jhu.csse_deaths_incidence_prop,
-  data = train_set, importance = "impurity")
-
-ranger_mdl$r.squared %>% setNames("r-square")
-```
-
-About 25% of variance explained.
-
-```{r}
-sort(importance(ranger_mdl), decreasing = TRUE) %>% head(10)
-```
-
-Many of the CMU data sources are described to have the most predictive power as well as a few county covariates and mobility measures.
-
-One nice property of tree-based methods are allowing for non-linear relationships across the support of a predictor. Below are the partial dependence plots of the top 10 predictors.
-
-```{r eval=FALSE, include=FALSE}
-# sort(importance(ranger_mdl), decreasing = TRUE) %>% head(4) %>%
-#   names() %>%
-#   map(~ partial(ranger_mdl, pred.var = .x, plot = TRUE))
-top_vars <- importance(ranger_mdl) %>% sort %>% tail(3) %>% names()
-
-lapply(top_vars, FUN = function(x) {
-  ranger_mdl %>%
-    partial(pred.var = top_vars, train = train_set) %>%
-    plotPartial() %>% return()
-})
-```
-
-What about performance on the test set?
-
-```{r}
-y_test <- test_set$jhu.csse_confirmed_incidence_prop
-preds <- predict(ranger_mdl, data = test_set)$predictions
-
-plot(y_test, preds)
-abline()
-1 -sum((preds - y_test)^2)/sum((y_test - mean(y_test))^2) %>%
-  setNames("r-square")
-```
-
-Significantly better than the OOB performance from training. Is that surprising?
-
-### Spike-and-slab
-
-```{r results="hide"}
-set.seed(823)
-ss_iters <- 10000
-ss_mdl <- lm.spike(
-  jhu.csse_confirmed_incidence_prop ~ . - jhu.csse_deaths_incidence_prop,
-  data = train_set, niter = ss_iters)
-```
-
-```{r}
-summary(ss_mdl)$rsquare["Mean"] %>% setNames("r-square")
-```
-
-In the same neighborhood on random forests for training.
-
-```{r}
-plot(ss_mdl, "scaled.coefficients", inclusion.threshold = 0.45)
-```
-
-Also fairly similar in variable selection as Random Forests but unfortunately no non-linearities to explore here, just slopes.
-
-Let's check test set performance:
-
-```{r}
-y_test <- test_set$jhu.csse_confirmed_incidence_prop
-preds <- predict(ss_mdl, newdata = test_set, mean.only = TRUE)
-
-plot(y_test, preds)
-1 - sum((preds - y_test)^2)/sum((y_test - mean(y_test))^2) %>%
-  setNames("r-square")
-```
-
-### SuperLearner
-
-SuperLearner is an ensemble approach that combines and weights multiple machine learning algorithms. In this case we will be using a basic mean estimator, elastic net, random forests, bayesian additive regression trees, xg-boost, and support vector machines.
-
-```{r}
-options(mc.cores = RhpcBLASctl::get_num_cores())
-set.seed(247, "L'Ecuyer-CMRG")
-
-y_train <- train_set$jhu.csse_confirmed_incidence_prop
-x_train <- train_set %>% select(-starts_with("jhu.csse_"))
-sl_lib <- c("SL.mean", "SL.glmnet", "SL.ranger", #"SL.bartMachine",
-            "SL.svm", "SL.xgboost")
-
-sl_mdl <- SuperLearner(Y = y_train, X = x_train, family = gaussian(),
-                       SL.library = sl_lib)
-1 - sum((sl_mdl$SL.predict - y_train)^2)/sum((y_train - mean(y_train))^2)
-```
-
-
-```{r}
-y_test <- test_set$jhu.csse_confirmed_incidence_prop
-x_test <- test_set %>% select(-starts_with("jhu.csse_"))
-
-preds <- SuperLearner::predict.SuperLearner(sl_mdl, newdata = x_test,
-                                            onlySL = TRUE)$pred
-plot(preds, y_test)
-1 - sum((preds - y_test)^2)/sum((y_test - mean(y_test))^2) %>%
-  setNames("r-square")
-```
-
-
-`CV.SuperLearner` provides a more honest estimate of performance by doing cross-validation across multiple calls to `SuperLearner`. It doesn't return an actual model though, so we can't run out of sample test performance with it.
-
-```{r}
-cvsl_mdl <- CV.SuperLearner(Y = y_train, X = x_train, family = gaussian(),
-                           # For a real analysis we would use V = 10.
-                           V = 10,
-                           parallel = "multicore",
-                           SL.library = sl_lib)
-1 - sum((cvsl_mdl$SL.predict - y_train)^2)/sum((y_train - mean(y_train))^2)
-```
-
-
-Model importance is `SuperLearner`s version of variable importance:
-
-```{r}
-plot(cvsl_mdl) + theme_bw()
-```
-
-## Appendix (old specifications)
+This notebook explores different models for predicting US county-level COVID cases and deaths. This includes transformations of the response variable (log, square root, logit, etc) as well as trading off the inclusion of different predictors and the effects of missingness on our sample of counties. We leverage variable selection via Spike-and-Slab to provide sparsity in our models to avoid overfitting.
 
 ### Missing values
 
@@ -363,7 +157,6 @@ cases_rich_logit <- county_joined_rich %>%
 cases_sparse_logit <- county_joined_sparse %>%
   select(-starts_with("jhu-csse_"), `jhu-csse_confirmed_incidence_prop`) %>%
   logit.spike(`jhu-csse_confirmed_incidence_prop` ~ ., data = ., niter=iters)
-
 ```
 
 ```{r}
@@ -452,7 +245,6 @@ tmp <- sapply(1:length(mdls), FUN = function(x) {
        main = paste(mdl_names[x], paste0(nrow(mdl$training.data), " counties"),
                     paste0("rsq: ", round(rsq, 2)), sep = " - ")) })
 ```
-
 
 ## Reproducibility
 
