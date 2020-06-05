@@ -1,5 +1,5 @@
 ---
-title: "Detecting covid-19 cases using machine learning"
+title: "Surveys and pandemics"
 author: "Hal Varian and Rob On"
 date: "`r format(Sys.time(), '%d %B, %Y')`"
 output:
@@ -7,10 +7,19 @@ output:
   html_notebook: default
   code_folding: hide
 ---
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE, message=FALSE)
+```
+
 ```{r include=FALSE}
+library(BoomSpikeSlab)
 library(drake)
 library(huxtable)
 library(tidyverse)
+library(ranger)
+library(missRanger)
+library(pdp)
+library(caret)
 nber_dat <- read_csv("https://ond3.com/covdata/nber_dat.csv")
 ```
 
@@ -48,14 +57,14 @@ Our hypothesis is that $pJ = k*pG + e$ where $k$ is a parameter to be estimated 
 		            
 $$
 \begin{aligned}
-\frac{cases}{population} = k * \frac{yes}{yes+no} + e
+\frac{cases}{population} \sim  \frac{yes}{yes+no}
 \end{aligned}
 $$
 		            
 Taking logs:
 $$
 \begin{aligned}
-log(cases)  = log(k) + \beta_1 log(population) + \beta_2 log (pG) + log(e) \\ = log(k) + \beta_1 log(population) + \beta_2 log (yes) - \beta_3 log(yes+no) + log(e)
+log(cases) = log(k) + \beta_1 log(population) + \beta_2 log (pG) + e \\ = log(k) + \beta_1 log(population) + \beta_2 log (yes) - \beta_3 log(yes+no) + e
 \end{aligned}
 $$
 
@@ -76,14 +85,14 @@ data.frame(fitted = goog_mdl$fitted.values, actual = goog_mdl$model[,1],
   theme_minimal() + theme(legend.position = "none") + coord_fixed() -> p
   
   #geom_smooth(formula = y ~ x, method = "lm") -> p
-p #plotly::ggplotly(p)
+p
 ```
 
 ### Important lessons
 
 #### Think of what you are trying to estimate and why?
 
-TODO: We want to predict cases, ahead of time to provide time for the local jurisdiction to contain the virus. Unfortunately it doesn't look like we're getting a lot of additional signal from the surveys. See that [here].
+We'd like to discover early indicators of disease growth. Surveys could be valuable tool in captured symptoms much earlier than they show up in confirmed case counts and may end up being more reliable. We explore the time series prediction component of this in another notebook here (TODO: provide link).
 
 #### Proxy questions are your friends.
 
@@ -95,44 +104,215 @@ fb_indiv_spec <- lm(
     log(fb_survey_raw_cli_value + 1) +
     log(fb_survey_raw_cli_sample_size + 1) +
     log(population + 1),
-  data = nber_dat %>% column_to_rownames("county_name"))
+  data = nber_dat %>% filter(!is.na(fb_survey_raw_hh_cmnty_cli_value)))
 
 fb_comm_spec <- lm(
   log(jhu_csse_confirmed_incidence_num_value + 1) ~
     log(fb_survey_raw_hh_cmnty_cli_value + 1) +
     log(fb_survey_raw_hh_cmnty_cli_sample_size + 1) +
     log(population + 1),
-   data = readd(nber_dat) %>% column_to_rownames("county_name"))
+   data = nber_dat %>% column_to_rownames("county_name"))
 
 fb_comm_nohh_spec <- lm(log(jhu_csse_confirmed_incidence_num_value + 1) ~
      log(fb_survey_raw_nohh_cmnty_cli_value + 1) +
        log(fb_survey_raw_nohh_cmnty_cli_sample_size + 1) +
        log(population + 1),
-   data = readd(nber_dat) %>% column_to_rownames("county_name"))
+   data = nber_dat %>% column_to_rownames("county_name"))
 
 ht <- huxreg(fb_indiv_spec, fb_comm_spec, fb_comm_nohh_spec,
              statistics = c(N = "nobs", R2 = "r.squared"))
-huxtable::position(ht) <- "left"
+position(ht) <- "left"
 ht
 ```
 
-We see a significant increase in $r^2$ from 0.595 to 0.806 using the community measures.
+We see a significant increase in $r^2$ from 0.571 to 0.810 using the community measures. What is also interesting is that including the household in the question actually hinders prediction.
 
-#### Data cleansing matters
+#### Data transparency and reproducibility
 
-All data for this notebook are scrapped directly from live sources on the web so it can be easily updated with the most recent data. A system of data pipelines and caching enables efficient and consistent fetching, cleaning, manipulation, provenance and of analysis of the data.  The figure below describes the system of data processes that produce the figures and tables in this document. This system is enabled by a package named [drake](https://github.com/ropensci/drake).
+All data for this notebook are scraped directly from sources on the web so it can be easily updated with the most recent data. A system of data pipelines and caching enables efficient and consistent fetching, cleaning, manipulation, provenance and of analysis of the data.  The figure below describes the system of data processes that produce the figures and tables in this document. This system is enabled by a package named [drake](https://github.com/ropensci/drake).
 ![Data pipeline from drake plan](nber-sankey.png)
 
-#### Variable selection via spike-slab is much easier than with lasso.
+A [drake plan](https://github.com/roboton/covid-covariates/blob/master/R/plan.R) instruments the production of these data sets and serve as a tool for data provenance, transparency and reproducibility. The analytical data sets are made available [here](https://ond3.com/covdata).
 
-TODO: What example should go here? The prediction model with everything in it? Modeling the county covariates to deaths? I have a feeling we could have done better with the SuperLearner on the data set that only included the 595 counties if we think that's worth trying again.
+#### Covariate variable selection provides some insight
+
+We find that the Google survey provides a reliable measure of county-level incidence across counties. The question itself is meant to ask about COVID-like illness (symptoms) rather than testing positive.  Therefore it's measuring something fundamentally different than the population who actually gets tested and receives a test and we would expect some variation around this measure.
+
+```{r}
+goog_mdl <- lm(log(jhu_csse_confirmed_incidence_num_value + 1) ~
+     log(google_survey_raw_cli_value + 1) +
+       log(google_survey_raw_cli_sample_size + 1) +
+       log(population + 1), 
+   data = nber_dat %>%
+     column_to_rownames("county_name"))
+huxreg(goog_mdl, statistics = c(N = "nobs", R2 = "r.squared"))
+
+data.frame(fitted = goog_mdl$fitted.values, actual = goog_mdl$model[,1],
+           population = goog_mdl$model[,4], fips = rownames(goog_mdl$model)) %>%
+  ggplot(aes(actual, fitted, label = fips)) +
+  geom_point(aes(color = goog_mdl$residuals)) +
+  scale_color_gradient2() +
+  theme_minimal() + theme(legend.position = "none") + coord_fixed() -> p
+p
+```
+
+Above we repeated the earlier basic regression now examine the remaining residuals in attempt to explain some of the discrepencies between having symptoms and producing an actual confirmed cases. Having positive and negative residuals could be explained by a number of factors and we explore below what these factors may be. We consider whether these factors explain the difference from COVID under or over reporting, conditional on COVID-like symptoms - or real variation in the actual illness across counties.
+
+```{r results="hide"}
+# cor_cols <- cor_cols <- nber_dat %>%
+#   select(pct_65_and_older:year_structure_built) %>%
+#   cor(use = "pairwise.complete") %>%
+#   findCorrelation(names = TRUE)
+county_covars_all <- nber_dat %>%
+  select(-geo_value:-indicator_combination_nmf_day_doc_fbs_ght_value, 
+         -starts_with("jhu_csse_"), county_name) %>%
+  missRanger(. ~ . - res - county_name)
+
+cor_cols <- county_covars_all %>%
+  select(-county_name) %>%
+  cor(use = "pairwise.complete") %>%
+  findCorrelation(names = TRUE)
+
+county_covars <- county_covars_all %>%
+  select(-one_of(cor_cols), -long_commute_driving_alone,
+         -residential_segregation_black_white,
+         -self_inflicted_injury_hospitalizations,
+         -food_environment_index) #%>%
+  #select_if(~ mean(is.na(.x)) < 0.05) %>%
+```
+
+```{r results="hide"}
+tibble(county_name = names(residuals(goog_mdl)), res = residuals(goog_mdl)) %>%
+  left_join(county_covars, by = "county_name") %>%
+  column_to_rownames("county_name") %>%
+  lm.spike(res ~ ., data = ., niter = 100000) -> ss_mdl
+```
+
+```{r}
+rsq <- summary(ss_mdl)$rsquare %>% .[["Mean"]] %>% setNames("rsquare")
+ss_mdl %>% plot("inclusion", inclusion.threshold = 0.5,
+                main = paste("r-square:", round(rsq, 2)))
+```
+
+The additional covariates explain `r round(rsq*100)`% of the remaining variance in the residuals.
+
+We see that increased food insecurity (likely measure of poverty) appears to result in lower confirmed cases relative to covid-like illness. One could imagine a number of explanations for this, including fewer testing facilities in poorer counties - or less infection due to an assocation between poverty and lower mobility/density.  We also see that racial segregation and black communities play a role as well. Both segregation and an increasing black population predict higher confirmed cases.
+
+We repeat the same analysis with random forests to see if covariate interactions explain more:
+
+```{r}
+tibble(county_name = names(residuals(goog_mdl)), res = residuals(goog_mdl)) %>%
+  left_join(county_covars, by = "county_name") %>%
+  column_to_rownames("county_name") %>%
+  select(-pct_native_hawaiian_other_pacific_islander) %>%
+  ranger(res ~ ., data = ., importance = "impurity") -> ranger_mdl
+
+ranger_mdl %>% importance() %>%
+  tibble(var = names(.), importance = .) %>%
+  top_n(10, importance) %>%
+  mutate(var = fct_reorder(var, importance)) %>%
+  ggplot(aes(var, importance)) + geom_bar(stat = "identity") +
+  coord_flip() + xlab(element_blank()) +
+  ggtitle(paste("r-square:", round(ranger_mdl$r.squared, 2))) +
+  theme_minimal()
+```
+
+Variance explained is about the same as do many of the predictors. Food insecurity and racial segregation both remain as meaningful predictors but other characteristics also appear. Other interesting factors emerge such as suicides, english proficiency, 
+
+With tree-based methods there isn't a uniformly positive or negative linear relationship with a predictor but the relationships can be explored via partial dependance plots which hold other values at median values and vary across the support of the predictor against the outcome. This provides some insight as to (a) the shape of the response and (b) the support within which the response is affected.
+
+```{r fig.height=10}
+top_vars <- importance(ranger_mdl) %>% sort %>% tail(10) %>% rev() %>% names()
+pdps <- lapply(top_vars, FUN = function(x) {
+  ranger_mdl %>%
+    partial(pred.var = x, train = county_covars) %>%
+    plotPartial()
+})
+do.call("grid.arrange", c(pdps, ncol=2))
+```
+
+Some intuitive findings are increases in social assocations predicting more confirmed cases, and older adults living alone (less nursing homes) as an indicator of the opposite.
+
+##### Deaths
+
+Previously we examined the covariates that predict variation between reported symptoms to confirmed cases, now we examine the same from reported symptoms to confirmed deaths. One could argue that deaths are less sensitive to testing procedures than cases and there may be many more county characteristic factors that explain why illness may not or may not translate to a recorded death. Since we don't expect deaths to map linearly to increased illness we model deaths as the square root of illness:
+
+$$ \frac{deaths}{population} = k*\frac{\sqrt{yes}}{yes+no}$$
+
+so we estimate:
+
+$$ \log(deaths) = log(k) + \beta_1log(population) + \beta_2log(\sqrt{yes}) + \beta_3log(yes+no) + e$$
+
+```{r}
+deaths_mdl <- lm(log(sqrt(jhu_csse_deaths_incidence_num_value) + 1) ~
+     log(google_survey_raw_cli_value + 1) +
+       log(google_survey_raw_cli_sample_size + 1) +
+       log(population + 1), 
+   data = nber_dat %>%
+     column_to_rownames("county_name"))
+huxreg(deaths_mdl, statistics = c(N = "nobs", R2 = "r.squared"))
+
+data.frame(fitted = deaths_mdl$fitted.values, actual = deaths_mdl$model[,1],
+           population = deaths_mdl$model[,4], fips = rownames(deaths_mdl$model)) %>%
+  ggplot(aes(actual, fitted, label = fips)) +
+  geom_point(aes(color = deaths_mdl$residuals)) +
+  scale_color_gradient2() +
+  theme_minimal() + theme(legend.position = "none") + coord_fixed() -> p
+p
+```
+
+This produces a linear relationship between our predictions and actual values.
+
+```{r results="hide"}
+tibble(county_name = names(residuals(deaths_mdl)), res = residuals(deaths_mdl)) %>%
+  left_join(county_covars, by = "county_name") %>%
+  column_to_rownames("county_name") %>%
+  lm.spike(res ~ ., data = ., niter = 100000) -> ss_mdl
+```
+
+```{r}
+rsq <- summary(ss_mdl)$rsquare %>% .[["Mean"]] %>% setNames("rsquare")
+ss_mdl %>% plot("inclusion", inclusion.threshold = 0.5,
+                main = paste("r-square:", round(rsq, 2)))
+```
+
+Racial segregation is a consistent factor both in modeling cases and deaths. There could be a number of explanations for this. Another indicator that stands out is the number of people driving to work alone. While this is often seen as a negative characteristic it serves as an intuitive factor for why shared modes of transit may lead to greater amounts of infection and deaths. Having a younger population is also intuitive as it has been documented that the young are much less susceptible to Covid deaths.  Homeownership is present, not quite sure how to explain this one.
+
+```{r}
+tibble(county_name = names(residuals(deaths_mdl)), res = residuals(deaths_mdl)) %>%
+  left_join(county_covars, by = "county_name") %>%
+  column_to_rownames("county_name") %>%
+  select(-pct_native_hawaiian_other_pacific_islander) %>%
+  ranger(res ~ ., data = ., importance = "impurity") -> ranger_mdl
+
+ranger_mdl %>% importance() %>%
+  tibble(var = names(.), importance = .) %>%
+  top_n(10, importance) %>%
+  mutate(var = fct_reorder(var, importance)) %>%
+  ggplot(aes(var, importance)) + geom_bar(stat = "identity") +
+  coord_flip() + xlab(element_blank()) +
+  ggtitle(paste("r-square:", round(ranger_mdl$r.squared, 2))) +
+  theme_minimal()
+```
+
+The random forests analysis of the same data has age related factors rising to the top. Homeownership remains importance, along with racial segregation.
+
+```{r fig.height=10}
+top_vars <- importance(ranger_mdl) %>% sort %>% tail(10) %>% rev() %>% names()
+pdps <- lapply(top_vars, FUN = function(x) {
+  ranger_mdl %>%
+    partial(pred.var = x, train = county_covars) %>%
+    plotPartial()
+})
+do.call("grid.arrange", c(pdps, ncol=2))
+```
 
 #### Using 595 counties is fine.
 
 From the specifications above you may have noticed only 595 counties had non-missing data for the survey predictors. With over 3,000 counties this may raise some concern about response bias from the survey.  The figure below shows each of the surveyed questionnaires and what percent of counties are covered by them.
 
 ```{r}
-readd(nber_dat) %>%
+nber_dat %>%
   select(population, contains("survey") & ends_with("_value")) %>%
   gather(metric, value, -population) %>%
   group_by(metric) %>%
@@ -187,5 +367,3 @@ lapply(seq(-0.2, 0.2, by = 0.05), gen_linex) %>%
 ```
 
 We can see how this can be useful in weighing our choices based on our predictions. Given a policy decision around a certain case threshold to allocate resources, we may want to be more conservative and treat underestimation more severely ($c < 0$).
-
-TODO: Example?
