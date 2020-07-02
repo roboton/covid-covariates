@@ -319,7 +319,7 @@ ranger_mdl %>% importance() %>%
 
 The random forests analysis of the same data has age related factors rising to the top. Homeownership remains important, along with racial segregation.
 
-```{r fig.height=10}
+```{r eval=FALSE, fig.height=10, include=FALSE}
 top_vars <- importance(ranger_mdl) %>% sort %>% tail(10) %>% rev() %>% names()
 pdps <- lapply(top_vars, FUN = function(x) {
   ranger_mdl %>%
