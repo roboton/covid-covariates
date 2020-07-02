@@ -207,12 +207,16 @@ covid_covariates_plan <- drake::drake_plan(
   
   nber_dat = covidcast_chr %>%
     #mutate_if(~ is.difftime(.x) | is.Date(.x), as.numeric) %>%
+    filter(date <= max(date[!is.na(google_survey_raw_cli_value)]) + weeks(4)) %>%
+    select_if(~ mean(is.na(.x)) < 1) %>%
     select(-date, -subregion1_code, -subregion2_code, -geo_type, -state_name) %>%
     # drop zero'd NYC counties
     filter(!geo_value %in% c("36005", "36047", "36081", "36085")) %>%
     unite(county_name, county_name, state_abb, sep = ", ") %>%
     group_by_at(vars(geo_value:geocode, starts_with("subregion"))) %>%
-    summarise_all(mean, na.rm = TRUE) %>% ungroup() %>%
+    #summarise_all(~ ifelse(all(is.na(.x)), NA, max(.x, na.rm = TRUE))) %>%
+    summarise_all(mean, na.rm = TRUE) %>%
+    ungroup() %>%
     #filter(!is.na(google_survey_raw_cli_value)) %>%
     mutate(google_survey_raw_cli_value = google_survey_raw_cli_value * 0.01 *
              google_survey_raw_cli_sample_size),

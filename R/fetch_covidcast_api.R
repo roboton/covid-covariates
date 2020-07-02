@@ -34,7 +34,7 @@ fetch_covidcast_api <- function() {
 # dependencies
 source(paste0(
   "https://raw.githubusercontent.com",
-  "/cmu-delphi/delphi-epidata/master/src/client/delphi_epidata.R"))
+  "/cmu-delphi/delphi-epidata/main/src/client/delphi_epidata.R"))
 
 # function to process a single api call
 fetch_delphi <- function(
