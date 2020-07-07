@@ -3,9 +3,12 @@ title: "Detecting covid-19 cases using machine learning"
 author: "Hal Varian, Robert On"
 date: "`r format(Sys.time(), '%d %B, %Y')`"
 output:
+  html_document:
+    toc: yes
+    df_print: paged
   html_notebook:
-    toc: true
-    toc_float: true
+    toc: yes
+    toc_float: yes
     code_folding: hide
 ---
 ```{r global_options, include=FALSE}
@@ -15,7 +18,7 @@ knitr::opts_chunk$set(echo=FALSE, warning=FALSE, message=FALSE)
 ```{r include=FALSE}
 # install.packages("fable", "plotly", "BoomSpikeSlab", "drake", "huxtable",
 #                  "tidyverse", "ranger", "missRanger", "pdp", "caret")
-spike_slab_iter <- 100
+spike_slab_iter <- 1000
 library(fable)
 library(plotly)
 library(BoomSpikeSlab)
@@ -27,6 +30,7 @@ library(pdp)
 library(caret)
 library(tidyverse)
 nber_dat <- read_csv("https://ond3.com/covdata/nber_dat.csv")
+# nber_dat <- read_csv("./Data/nber_dat.csv")
 ```
 
 # Motivation
@@ -61,7 +65,8 @@ $$
 Taking logs:
 $$
 \begin{aligned}
-log(cases) = log(k) + \beta_1 log(population) + \beta_2 log (pG) + e \\ = log(k) + \beta_1 log(population) + \beta_2 log (yes) - \beta_3 log(yes+no) + e
+log(cases) &= log(k) + \beta_1 log(population) + \beta_2 log (pG) + e \\ 
+           &= log(k) + \beta_1 log(population) + \beta_2 log (yes) - \beta_3 log(yes+no) + e
 \end{aligned}
 $$
 
@@ -170,8 +175,9 @@ huxreg(goog_mdl, statistics = c(N = "nobs", R2 = "r.squared"))
 data.frame(fitted = goog_mdl$fitted.values, actual = goog_mdl$model[,1],
            population = goog_mdl$model[,4], fips = rownames(goog_mdl$model)) %>%
   ggplot(aes(actual, fitted, label = fips)) +
-  geom_point(aes(color = goog_mdl$residuals)) +
-  scale_color_gradient2() +
+  geom_point() +
+  # geom_point(aes(color = goog_mdl$residuals)) +
+  # scale_color_gradient2() +
   theme_minimal() + theme(legend.position = "none") + coord_fixed() -> p
 ggplotly(p)
 ```
@@ -180,6 +186,7 @@ Above we repeated the earlier basic regression. Here we now examine the remainin
 
 ```{r results="hide"}
 county_covars <- read_csv("https://ond3.com/covdata/county_covars.csv")
+# county_covars <- read_csv("./Data/county_covars.csv")
 # # cor_cols <- cor_cols <- nber_dat %>%
 # #   select(pct_65_and_older:year_structure_built) %>%
 # #   cor(use = "pairwise.complete") %>%
@@ -209,12 +216,13 @@ tibble(county_name = names(residuals(goog_mdl)), res = residuals(goog_mdl)) %>%
 ```
 
 ```{r}
-rsq <- summary(ss_mdl)$rsquare %>% .[["Mean"]] %>% setNames("rsquare")
-ss_mdl %>% plot("inclusion", inclusion.threshold = 0.5,
-                main = paste("r-square:", round(rsq, 2)))
+ss_rsq <- summary(ss_mdl)$rsquare %>% .[["Mean"]] %>% setNames("rsquare")
+ss_mdl %>% plot("inclusion",
+                 inclusion.threshold = 0.5,
+                 main = paste("r-square:", round(ss_rsq, 2)))
 ```
 
-The additional covariates explain `r round(rsq*100)`% of the remaining variance in the residuals.
+The additional covariates explain `r round(ss_rsq*100)`% of the remaining variance in the residuals.
 
 We see that increased food insecurity (likely measure of poverty) appears to result in lower confirmed cases relative to covid-like illness. One could imagine a number of explanations for this, including fewer testing facilities in poorer counties - or less infection due to an association between poverty and lower mobility/density.  We also see that racial segregation and black communities play a role as well. Both segregation and an increasing black population predict higher confirmed cases.
 
@@ -241,17 +249,16 @@ Variance explained is about the same as do many of the predictors. Food insecuri
 
 With tree-based methods there isn't a uniformly positive or negative linear relationship with a predictor but the relationships can be explored via "Partial Dependance Plots" which hold other values at median values and vary across the support of the predictor against the outcome. This provides some insight as to (a) the shape of the response and (b) the support within which the response is affected.
 
-```{r eval=FALSE, fig.height=10, include=FALSE}
-top_vars <- importance(ranger_mdl) %>% sort %>% tail(10) %>% rev() %>% names()
-pdps <- lapply(top_vars, FUN = function(x) {
-  ranger_mdl %>%
-    pdp::partial(pred.var = x, train = county_covars) %>%
-    pdp::plotPartial()
-})
-do.call("grid.arrange", c(pdps, ncol=2))
-```
-
-Some intuitive findings are increases in social associations predicting more confirmed cases, and older adults living alone (less nursing homes) as an indicator of the opposite.
+ ```{r eval=FALSE, fig.height=10, include=FALSE}
+# top_vars <- importance(ranger_mdl) %>% sort %>% tail(10) %>% rev() %>% names()
+# pdps <- lapply(top_vars, FUN = function(x) {
+#   ranger_mdl %>%
+#     pdp::partial(pred.var = x, train = county_covars) %>%
+#     pdp::plotPartial()
+# })
+# do.call("grid.arrange", c(pdps, ncol=2))
+ ```
+ Some intuitive findings are increases in social associations predicting more confirmed cases, and older adults living alone (less nursing homes) as an indicator of the opposite.
 
 ##### Deaths
 
@@ -293,9 +300,10 @@ tibble(county_name = names(residuals(deaths_mdl)), res = residuals(deaths_mdl)) 
 ```
 
 ```{r d3}
-rsq <- summary(ss_mdl)$rsquare %>% .[["Mean"]] %>% setNames("rsquare")
-ss_mdl %>% plot("inclusion", inclusion.threshold = 0.5,
-                main = paste("r-square:", round(rsq, 2)))
+ss_rsq <- summary(ss_mdl)$rsquare %>% .[["Mean"]] %>% setNames("rsquare")
+ss_mdl %>% plot("inclusion",
+                 inclusion.threshold = 0.5,
+                 main = paste("r-square:", round(ss_rsq, 2)))
 ```
 
 Racial segregation is a consistent factor both in modeling cases and deaths. There could be a number of explanations for this. Another indicator that stands out is the number of people driving to work alone. While this is often seen as a negative characteristic it serves as an intuitive factor for why shared modes of transit such as subways may lead to greater amounts of infection and deaths. Having a younger population is also intuitive as it has been documented that the young are much less susceptible to Covid deaths.  Homeownership has a high probability of inclusion but we're uncertain as to how to explain its relationship.
@@ -319,15 +327,15 @@ ranger_mdl %>% importance() %>%
 
 The random forests analysis of the same data has age related factors rising to the top. Homeownership remains important, along with racial segregation.
 
-```{r eval=FALSE, fig.height=10, include=FALSE}
-top_vars <- importance(ranger_mdl) %>% sort %>% tail(10) %>% rev() %>% names()
-pdps <- lapply(top_vars, FUN = function(x) {
-  ranger_mdl %>%
-    pdp::partial(pred.var = x, train = county_covars) %>%
-    pdp::plotPartial()
-})
-do.call("grid.arrange", c(pdps, ncol=2))
-```
+ ```{r eval=FALSE, fig.height=10, include=FALSE}
+# top_vars <- importance(ranger_mdl) %>% sort %>% tail(10) %>% rev() %>% names()
+# pdps <- lapply(top_vars, FUN = function(x) {
+#   ranger_mdl %>%
+#     pdp::partial(pred.var = x, train = county_covars) %>%
+#     pdp::plotPartial()
+# })
+# do.call("grid.arrange", c(pdps, ncol=2))
+ ```
 
 ## Residuals, big regression or time fixed effect
 
@@ -357,6 +365,7 @@ huxreg(big_mdl, statistics = c(N = "nobs", R2 = "r.squared"))
 
 ```{r}
 covidcast <- read_csv("https://ond3.com/covdata/cmu_covidcast.csv",
+#covidcast <- read_csv("./Data/cmu_covidcast.csv",
                       col_types = cols(
                         geo_type = "c", geo_value = "c", date = "D",
                         county_name = "c", state_name = "c", state_abb = "c",
@@ -372,7 +381,7 @@ covid_ts <- covidcast %>%
 ```
 
 ```{r}
-fcst <- covid_ts %>% filter(date < "2020-05-15") %>%
+fcst <- covid_ts %>% filter(date < "2020-06-01") %>%
   fill(jhu_csse_confirmed_cumulative_num_value, .direction = "down") %>%
   select(jhu_csse_confirmed_cumulative_num_value) %>%
   filter(county_name %in% c("New York County, NY",
@@ -383,7 +392,7 @@ fcst <- covid_ts %>% filter(date < "2020-05-15") %>%
     arima = ARIMA(jhu_csse_confirmed_cumulative_num_value),
     rw = RW(jhu_csse_confirmed_cumulative_num_value)
   ) %>%
-  forecast(h = "2 week")
+  forecast(h = "4 week")
 
 fcst %>% accuracy(covid_ts)
 
@@ -430,7 +439,7 @@ nber_dat %>%
 ## Fetching and wrangling the data
 
 All data for this notebook are scraped directly from sources on the web so it can be easily updated with the most recent data. A system of data pipelines and caching enables efficient and consistent fetching, cleaning, manipulation, provenance and of analysis of the data.  The figure below describes the system of data processes that produce the figures and tables in this document. This system is enabled by a package named [drake](https://github.com/ropensci/drake).
-![Data pipeline from drake plan](nber-sankey.png)
+%[Data pipeline from drake plan](nber-sankey.png)
 
 A [drake plan](https://github.com/roboton/covid-covariates/blob/master/R/plan.R) instruments the production of these data sets and serve as a tool for data provenance, transparency and reproducibility. The analytical data sets are made available [here](https://ond3.com/covdata).
 
