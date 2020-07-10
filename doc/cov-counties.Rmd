@@ -1,56 +1,60 @@
 ---
 title: "Detecting covid-19 cases using machine learning"
+subtitle: "County Cross-section"
 author: "Hal Varian, Robert On"
 date: "`r format(Sys.time(), '%d %B, %Y')`"
 output:
-  html_document:
-    toc: yes
-    df_print: paged
   html_notebook:
     toc: yes
     toc_float: yes
     code_folding: hide
+  html_document:
+    toc: yes
+    df_print: paged
 ---
 ```{r global_options, include=FALSE}
 knitr::opts_chunk$set(echo=FALSE, warning=FALSE, message=FALSE)
 ```
 
+Loading required packages.
+
 ```{r include=FALSE}
 # install.packages("fable", "plotly", "BoomSpikeSlab", "drake", "huxtable",
 #                  "tidyverse", "ranger", "missRanger", "pdp", "caret")
 spike_slab_iter <- 1000
+# time series forecasting
 library(fable)
+# interactive html plots
 library(plotly)
+# spike and slab variable selection
 library(BoomSpikeSlab)
-library(drake)
+# data pipeline
+# library(drake)
+# nicely formatted regression tables
 library(huxtable)
+# fast random forests
 library(ranger)
-library(missRanger)
-library(pdp)
+# missing data imputation using ranger
+# library(missRanger)
+# partial dependance plots
+# library(pdp)
+# ML library
 library(caret)
+# general data manipulation
 library(tidyverse)
+```
+
+```{r}
+# read in prepared data
 nber_dat <- read_csv("https://ond3.com/covdata/nber_dat.csv")
 # nber_dat <- read_csv("./Data/nber_dat.csv")
 ```
 
-# Motivation
-
-Confirmed cases and deaths are reported daily by [Johns Hopkins](https://coronavirus.jhu.edu/us-map) and are updated on a periodic basis.   However, these data are often reported with a lag and it would be helpful to have a contemporaneous prediction (a nowcast) based on easily observed predictors for at least two reasons:
-
-1. this would help hospitals ready for an increase in patients, and
-2. this would help contract tracing efforts focus on areas where there might be potential outbreaks.
+## Motivation
 
 We explore the potential of survey-based data as a way to accurately measure the incidence of disease for these purposes. This notebook focuses on a cross-sectional geographical analysis of incidence while a follow up will focus on the time dimension.
 
-## Problem Statement
-
-## Survey of self-reported symptoms
-
-## Proxy questions
-
-# Basic model
-
-## Univariate
+Hypothesis: Survey data should look like population data.
 
 Our basis model is very simple.  We have two variables,  $pJ$, defined as confirmed cases as a fraction of population from John Hopkins, and $pG$, defined as the fraction of Google Survey respondents who answer “yes” to the proxy question.
 
@@ -84,12 +88,14 @@ huxreg(goog_mdl, statistics = c(N = "nobs", R2 = "r.squared"))
 data.frame(fitted = goog_mdl$fitted.values, actual = goog_mdl$model[,1],
            population = goog_mdl$model[,4], fips = rownames(goog_mdl$model)) %>%
   ggplot(aes(actual, fitted, label = fips)) + geom_point() +
-  geom_abline(slope = 1) + 
+  geom_smooth(method = "lm", formula = y ~ x) + 
   theme_minimal() + theme(legend.position = "none") + coord_fixed() -> p
 ggplotly(p)
 ```
 
 ### Train/test
+
+What is common in the machine learning is to keep our predictive models "honest" by estimating its performance on data the model was not trained with.
 
 ```{r}
 nber_train_test <- nber_dat %>% mutate(
@@ -120,9 +126,12 @@ goog_test_r2 <- goog_mdl_test %>%
   round(2)
 
 goog_mdl_test %>% ggplot(aes(predicted, actual)) + geom_point() +
+  geom_smooth(method = "lm", formula = y ~ x) + 
   ggtitle(paste("test r^2 =", goog_test_r2)) -> p
 ggplotly(p)
 ```
+
+Our out-of-sample $r^2$ is in the same range as our training model giving us confidence we did not overfit, however given the simplicity of the model it was unlikely we would.
 
 ### Proxy questions
 
@@ -155,37 +164,42 @@ position(ht) <- "left"
 ht
 ```
 
-# County rankings
+## Additional signals
 
-## Use other county predictors from health ranking
-
-## Spike-slab + random forests from county health data
-
-We find that the Google survey provides a reliable measure of county-level incidence across counties. The question itself is meant to ask about COVID-like illness (symptoms) rather than testing positive.  Therefore it's measuring something fundamentally different than the population who actually gets tested and receives a test and we would expect some variation around this measure.
+The COVIDcast API includes a number of other signals that could contain information on covid incidence.
 
 ```{r}
-goog_mdl <- lm(log(jhu_csse_confirmed_incidence_num_value + 1) ~
+all_mdl <- lm(log(jhu_csse_confirmed_incidence_num_value + 1) ~
+     log(population + 1) +
      log(google_survey_raw_cli_value + 1) +
        log(google_survey_raw_cli_sample_size + 1) +
-       log(population + 1), 
+     log(fb_survey_smoothed_nohh_cmnty_cli_value + 1) +
+       log(fb_survey_smoothed_nohh_cmnty_cli_sample_size + 1) +
+     log(safegraph_completely_home_prop_value + 1) +
+     log(safegraph_full_time_work_prop_value + 1) +
+     log(safegraph_median_home_dwell_time_value + 1) +
+     log(safegraph_part_time_work_prop_value + 1) +
+     log(safegraph_median_home_dwell_time_value + 1),  
    data = nber_dat %>%
-     column_to_rownames("county_name"))
-huxreg(goog_mdl, statistics = c(N = "nobs", R2 = "r.squared"))
+     mutate(population = if_else(county_name == "District of Columbia, NA",
+                                 705749, population)) %>%
+     column_to_rownames("county_name") %>%
+     filter(!is.na(google_survey_raw_cli_value)) %>%
+     select_if(~ is.numeric(.x) & mean(!is.na(.x)) == 1)) %>% summary()
 
-data.frame(fitted = goog_mdl$fitted.values, actual = goog_mdl$model[,1],
-           population = goog_mdl$model[,4], fips = rownames(goog_mdl$model)) %>%
-  ggplot(aes(actual, fitted, label = fips)) +
-  geom_point() +
-  # geom_point(aes(color = goog_mdl$residuals)) +
-  # scale_color_gradient2() +
-  theme_minimal() + theme(legend.position = "none") + coord_fixed() -> p
-ggplotly(p)
+huxreg(all_mdl, statistics = c(N = "nobs", R2 = "r.squared"))
 ```
 
-Above we repeated the earlier basic regression. Here we now examine the remaining residuals in an attempt to explain some of the discrepancies between having symptoms and producing actual confirmed cases. Having positive and negative residuals could be explained by a number of factors and we explore below what these factors may be. We consider whether these factors explain the difference from COVID under or over reporting, conditional on COVID-like symptoms - or real variation in the actual illness across counties.
+When we include all the other signals, $r^2$ improves 4.5pp.
+
+## County health rankings
+
+[CountyHealthRankings.org](https://www.countyhealthrankings.org/) contains demographic information for every county in the US.
+
+We'd like to understand how county characterics explain some of the variation in covid cases.  We include the predicted values to examine what additional county covariates are significant in explaining the remaining variation.
 
 ```{r results="hide"}
-county_covars <- read_csv("https://ond3.com/covdata/county_covars.csv")
+# county_covars <- read_csv("https://ond3.com/covdata/county_covars.csv")
 # county_covars <- read_csv("./Data/county_covars.csv")
 # # cor_cols <- cor_cols <- nber_dat %>%
 # #   select(pct_65_and_older:year_structure_built) %>%
@@ -208,11 +222,11 @@ county_covars <- read_csv("https://ond3.com/covdata/county_covars.csv")
 #   #select_if(~ mean(is.na(.x)) < 0.05) %>%
 ```
 
-```{r d0, results="hide"}
+```{r results="hide"}
 tibble(county_name = names(residuals(goog_mdl)), res = residuals(goog_mdl)) %>%
   left_join(county_covars, by = "county_name") %>%
   column_to_rownames("county_name") %>%
-  lm.spike(res ~ ., data = ., niter = spike_slab_iter) -> ss_mdl
+  lm.spike(res ~ ., data = ., niter = spike_slab_iter * 10) -> ss_mdl
 ```
 
 ```{r}
@@ -249,7 +263,7 @@ Variance explained is about the same as do many of the predictors. Food insecuri
 
 With tree-based methods there isn't a uniformly positive or negative linear relationship with a predictor but the relationships can be explored via "Partial Dependance Plots" which hold other values at median values and vary across the support of the predictor against the outcome. This provides some insight as to (a) the shape of the response and (b) the support within which the response is affected.
 
- ```{r eval=FALSE, fig.height=10, include=FALSE}
+```{r eval=FALSE, fig.height=10, include=FALSE}
 # top_vars <- importance(ranger_mdl) %>% sort %>% tail(10) %>% rev() %>% names()
 # pdps <- lapply(top_vars, FUN = function(x) {
 #   ranger_mdl %>%
@@ -257,8 +271,72 @@ With tree-based methods there isn't a uniformly positive or negative linear rela
 #     pdp::plotPartial()
 # })
 # do.call("grid.arrange", c(pdps, ncol=2))
- ```
+```
+
  Some intuitive findings are increases in social associations predicting more confirmed cases, and older adults living alone (less nursing homes) as an indicator of the opposite.
+ 
+ 
+# New stuff
+
+```{r}
+covar_dat <- nber_dat %>%
+  inner_join(data.frame(county_name = names(goog_mdl$fitted),
+                        predicted = goog_mdl$fitted),
+             by = "county_name") %>%
+  select(jhu_csse_deaths_incidence_num_value, predicted,
+         pct_65_and_older:year_structure_built) %>%
+  select_if(~ mean(!is.na(.x)) == 1) %>% mutate_all(~ log(.x + 1))
+
+covar_mdl <- lm(jhu_csse_deaths_incidence_num_value ~ ., covar_dat)
+
+huxreg(covar_mdl, statistics = c(N = "nobs", R2 = "r.squared"))
+```
+
+### Spike-slab
+
+Now do variable selection with spike-slab
+
+```{r}
+ss_mdl <- lm.spike(jhu_csse_deaths_incidence_num_value ~ ., niter = 10000,
+                   data = covar_dat)
+```
+
+```{r}
+ss_rsq <- summary(ss_mdl)$rsquare %>% .[["Mean"]] %>% setNames("rsquare")
+ss_mdl %>% plot("inclusion",
+                 inclusion.threshold = 0.5,
+                 main = paste("r-square:", round(ss_rsq, 2)))
+```
+
+### Random forests
+
+Not sure if RF is useful here.
+
+```{r}
+ranger_mdl <- ranger(jhu_csse_deaths_incidence_num_value ~ .,
+                     data = covar_dat, importance = "impurity")
+
+ranger_mdl %>% importance() %>%
+  tibble(var = names(.), importance = .) %>%
+  top_n(10, importance) %>%
+  mutate(var = fct_reorder(var, importance)) %>%
+  ggplot(aes(var, importance)) + geom_bar(stat = "identity") +
+  coord_flip() + xlab(element_blank()) +
+  ggtitle(paste("r-square:", round(ranger_mdl$r.squared, 2))) +
+  theme_minimal()
+```
+
+Partial dependance plots for these variables are shown below:
+
+```{r fig.height=10}
+top_vars <- importance(ranger_mdl) %>% sort %>% tail(10) %>% rev() %>% names()
+pdps <- lapply(top_vars, FUN = function(x) {
+  ranger_mdl %>%
+    pdp::partial(pred.var = x, train = covar_dat) %>%
+    pdp::plotPartial()
+})
+do.call("grid.arrange", c(pdps, ncol=2))
+```
 
 ##### Deaths
 
@@ -272,7 +350,7 @@ so we estimate:
 
 $$ \log(deaths) = log(k) + \beta_1log(population) + \beta_2log(\sqrt{yes}) + \beta_3log(yes+no) + e$$
 
-```{r d1, message=FALSE, warning=FALSE}
+```{r message=FALSE, warning=FALSE}
 deaths_mdl <- lm(log(sqrt(jhu_csse_deaths_incidence_num_value) + 1) ~
      log(google_survey_raw_cli_value + 1) +
        log(google_survey_raw_cli_sample_size + 1) +
@@ -292,7 +370,7 @@ ggplotly(p)
 
 We get a linear relationship between our predictions and actual values.
 
-```{r d2, results="hide"}
+```{r results="hide"}
 tibble(county_name = names(residuals(deaths_mdl)), res = residuals(deaths_mdl)) %>%
   left_join(county_covars, by = "county_name") %>%
   column_to_rownames("county_name") %>%
@@ -327,7 +405,7 @@ ranger_mdl %>% importance() %>%
 
 The random forests analysis of the same data has age related factors rising to the top. Homeownership remains important, along with racial segregation.
 
- ```{r eval=FALSE, fig.height=10, include=FALSE}
+```{r eval=FALSE, fig.height=10, include=FALSE}
 # top_vars <- importance(ranger_mdl) %>% sort %>% tail(10) %>% rev() %>% names()
 # pdps <- lapply(top_vars, FUN = function(x) {
 #   ranger_mdl %>%
@@ -335,27 +413,9 @@ The random forests analysis of the same data has age related factors rising to t
 #     pdp::plotPartial()
 # })
 # do.call("grid.arrange", c(pdps, ncol=2))
- ```
-
-## Residuals, big regression or time fixed effect
-
-Here we do the regression with all covariates as well as Google prop included.
-
-```{r}
-big_mdl <- nber_dat %>%
-  select(county_name, jhu_csse_confirmed_cumulative_num_value,
-         google_survey_raw_cli_value,
-         google_survey_raw_cli_sample_size) %>%
-  left_join(county_covars, by = "county_name") %>%
-  mutate(google_survey_raw_cli_prop = google_survey_raw_cli_value /
-           google_survey_raw_cli_sample_size) %>%
-  select(-google_survey_raw_cli_value, -google_survey_raw_cli_sample_size) %>%
-  filter(!is.na(google_survey_raw_cli_prop)) %>%
-  column_to_rownames("county_name") %>%
-  lm(jhu_csse_confirmed_cumulative_num_value ~ ., data = .)
-
-huxreg(big_mdl, statistics = c(N = "nobs", R2 = "r.squared"))
 ```
+
+
 
 # Forecasting
 
