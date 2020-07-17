@@ -1,16 +1,15 @@
 ---
-title: "Detecting covid-19 cases using machine learning"
-subtitle: "County Cross-section"
+title: "Nowcasting covid-19 cases"
 author: "Hal Varian, Robert On"
 date: "`r format(Sys.time(), '%d %B, %Y')`"
 output:
+  html_document:
+    toc: yes
+    df_print: paged
   html_notebook:
     toc: yes
     toc_float: yes
     code_folding: hide
-  html_document:
-    toc: yes
-    df_print: paged
 ---
 ```{r global_options, include=FALSE}
 knitr::opts_chunk$set(echo=FALSE, warning=FALSE, message=FALSE)
@@ -21,7 +20,7 @@ Loading required packages.
 ```{r include=FALSE}
 # install.packages("fable", "plotly", "BoomSpikeSlab", "drake", "huxtable",
 #                  "tidyverse", "ranger", "missRanger", "pdp", "caret")
-spike_slab_iter <- 1000
+spike_slab_iter <- 2000
 # interactive html plots
 library(plotly)
 # spike and slab variable selection
@@ -33,25 +32,86 @@ library(ranger)
 # general data manipulation
 library(tidyverse)
 ```
-
-```{r include=FALSE}
+```{r include=FALSE,label="read data"}
 # read in prepared data
 nber_dat <- read_csv("https://ond3.com/covdata/nber_dat.csv")
 # nber_dat <- read_csv("./Data/nber_dat.csv")
 ```
 
-## Motivation
+## Abstract
 
-We explore the potential of survey-based data as a way to accurately measure the incidence of disease for these purposes. This notebook focuses on a cross-sectional geographical analysis of incidence while a follow up will focus on the time dimension.
+We explore the potential of survey data for early detection of
+covid-19 at the county level.  Our most important result is that
+"proxy questions" about symptoms at a community level are significantly
+better predictors than questions about symptoms at the household
+level.  We also examine a number of other cross-sectional and time
+series predictors at the county level.
 
+## Methodology
 
-## Base model
+There are two approaches to prediction in economics: structural
+modeling and reduced form modeling.  Structural models are concerned
+with causal relationships, the impact of interventions, and long-term
+forecasts.  Reduced forms generally consider short-run forecasts, and
+rely on correlation and extrapolation.  The goal here is to get the
+most accurate short-run predictions
 
-Hypothesis: Survey data should look like population data.
+An example of a structural models is the famous SIR model [list of
+cites].  This is emphatically not the goal of this note.  Our focus is
+only on short run prediction [list of cites].
 
-Our basis model is very simple.  We have two variables,  $pJ$, defined as confirmed cases as a fraction of population from John Hopkins, and $pG$, defined as the fraction of Google Survey respondents who answer “yes” to the proxy question.
+## Survey design
 
-Our hypothesis is that $pJ = k*pG + e$ where $k$ is a parameter to be estimated and $e$ is an error term.  We could estimate this equation directly, but we could also use the definitions of $pG$ and $pJ$ to write:
+In February 2020, the [Delphi project](https://delphi.cmu.edu/) was
+asked by the CDC to build a county-level predictive model for covid-19
+confirmed cases. Ryan Tibshirani, co-leader of Delphi felt strongly
+that survey level symptom data would be helpful in this project.
+
+In mid-March 2020 we worked with the Delphi group to launch a
+one-question survey asking "Do you or anyone in your household have a
+fever of 100 degrees F or higher along with a sore throat or cough?”
+This question was modeled on the CDC definition of
+influenza-like-illness used in the [Influenza Surveillance
+System](https://www.cdc.gov/flu/weekly/overview.htm). From now on we
+will refer to this as the "household question".
+
+The survey responses turned out to be very helpful as predictors of
+confirmed cases, as we will show below.  According to Professor
+Tibshirani it was the best predictor they had.  A simple univariate
+linear regression between the question response and cases yielded an
+$R^2$ of 0.59.
+
+Unfortunately this survey had to be discontinued at the end of March
+due to concerns about the question wording.  Brett Slakin, the
+co-creator of Google Surveys suggested using a proxy question of the
+form "Do you know of someone in your community who is sick with a
+fever, along with cough, shortness of breath, or difficulty breathing
+right now?”  We will refer to this question as the "community
+question".
+
+Our expectation was that this somewhat vague question would not perform
+as well as the household questions, but we turned out to be dead
+wrong: the community question had an $R^2$ of 0.81, which was quite an
+improvement over the previous question.  There are also a number of
+other advantages of this proxy question has over the traditional
+household question.  We will discuss this below, after we take a look
+at the simple analytic models we used.
+
+## Basic model
+
+Our basis model is very simple.  We have two variables, $pJ$, defined
+as confirmed cases as a fraction of population from John Hopkins, and
+$pG$, defined as the fraction of Google Survey respondents who answer
+“yes” to the survey question.  Note that the survey question had three
+responses, "yes", "no", and "prefer not to answer".  We found that
+using the definitive responses, "yes" and "no", gave us a better fit
+than including the "prefer not to answer" response.
+
+Our initial regression specification is $$pJ_{ct} = k*pG_{ct} +
+  e_{ct}$$ where $k$ is a parameter to be estimated and $e_{ct}$ is an
+  error term.  We could estimate this equation directly, but it is
+  relatively inflexible. Instead, we use the definitions of $pG$ and
+  $pJ$ to write:
 		            
 $$
 \begin{aligned}
@@ -67,9 +127,13 @@ log(cases) &= log(k) + \beta_1 log(population) + \beta_2 log (pG) + e \\
 \end{aligned}
 $$
 
-We can estimate either of these equations depending on data availability.  We can also add various controls such as country health characteristics, lagged values of cases, county fixed effects, and so on.  But even if we use this very simple specification, we get nice results, as shown in this plot of actual versus predicted cases.
+We can estimate any of these equations depending on data availability.
+We can also add various controls such as country health
+characteristics, lagged values of cases, county fixed effects, and so
+on.  But even if we use this very simple specification, we get nice
+results, as shown in this plot of actual versus predicted cases.
 
-```{r}
+```{r, label="basic model"}
 goog_mdl <- lm(log(jhu_csse_confirmed_incidence_num_value + 1) ~
      log(google_survey_raw_cli_value + 1) +
        log(google_survey_raw_cli_sample_size + 1) +
@@ -88,9 +152,14 @@ ggplotly(p)
 
 ### Train/test
 
-What is common in the machine learning is to keep our predictive models "honest" by estimating its performance on data the model was not trained with. Here we randomly split our data into a training set with 75% of the observations and 25% for the test set.
+The reported results are in-sample fit, which is fine for this simple
+regression.  But just to be safe, we randomly split our data into a
+training set with 75% of the observations and 25% for a test set,
+which gave us essentially the same results as in the in-sample fit.
+We also used cross validation which is not reported but also gave us
+similar results.
 
-```{r}
+```{r,label="train/test"}
 nber_train_test <- nber_dat %>% mutate(
   sample_type = if_else(rbinom(n(), 1, 0.75) == 1, "train", "test"))
 
@@ -124,13 +193,19 @@ goog_mdl_test %>% ggplot(aes(predicted, actual)) + geom_point() +
 ggplotly(p)
 ```
 
-Our out-of-sample $r^2$ is in the same range as our training model giving us confidence we did not overfit, however given the simplicity of the model it was unlikely we would.
+### Proxy experiment
 
-### Proxy questions
+In early April, Facebook started encouraging their users to go to a
+new survey created by the Delphi group at CMU.  This gave us a chance
+to have a direct comparison between the household and the community
+questions.  Below we compare the results of three treatments household
+alone, community alone, and both together.  Note that the community
+question alone was also somewhat better than having both questions.
 
-Earlier we saw how well the community-based question in Google surveys proxied for county-level incidence but how would this compare to a question that simply asked the question directly to an individual? An analogous set of surveys run by Facebook asked the question at the individual level which initially did not have much predictive value until it was changed to mimic the community-based Google question.
+This suggests that in future applications, one could use both
+questions initially and then choose the question that performed best.
 
-```{r}
+```{r,label="proxy experiment"}
 fb_indiv_spec <- lm(
   log(jhu_csse_confirmed_incidence_num_value + 1) ~
     log(fb_survey_raw_cli_value + 1) +
@@ -157,9 +232,15 @@ position(ht) <- "left"
 ht
 ```
 
-### Additional signals
+### Additional predictors
 
-The COVIDcast API includes a number of other signals that could contain information on covid incidence.
+Up until now we have looked at regressions using survey responses.
+However the Delphi website, [covidcast.cmu.edu](covidcast.cmu.edu) has
+other predictors, including doctor visits, hospital admissions, away
+from home, Google Trends searches, and so on.  Below we run a
+regression with these predictors and observe only a small increase in
+$R^2$ from these additional prdictors.
+
 
 ```{r}
 all_mdl <- lm(log(jhu_csse_confirmed_incidence_num_value + 1) ~
@@ -182,22 +263,42 @@ all_mdl <- lm(log(jhu_csse_confirmed_incidence_num_value + 1) ~
 
 huxreg(all_mdl, statistics = c(N = "nobs", R2 = "r.squared"))
 ```
+### Proxy question discussion
 
-When we include all the other signals, $r^2$ improves 4.5pp.
+The proxy approach seems to offer several advantages over the
+household approach.  First, as we have shown above it provides more
+accurate predictions, a feature of proxy questions that has been observed
+in other contexts.  For example, suppose you are interested in
+automobile demand in a particular region.  Since buying a car is a
+rare event, you would have to ask many individuals in order to get a
+good estimate of purchase intent.  But if you ask "Do you know
+anyone that is shopping for a car?" you may get a much more useful
+survey result.
 
-## County health rankings
+Second, a proxy question may be useful when asking questions about
+sensitive issues such as health.  Third, response rates may increase
+since respondents might be willing to talk more about their community
+than about themselves.  Fourth, proxy questions may be useful when it
+is costly or difficult to locate the respondent you seek.  [Cite the
+medical literature, cite the Census bureau paper.]
 
-[CountyHealthRankings.org](https://www.countyhealthrankings.org/) contains demographic information for every county in the US.
+The bottom line is that proxy questions can be very useful in survey
+research and should be more widely used.
 
-We'd like to understand how county characterics explain some of the remaining variation in covid cases. We use the fitted values from the regression of the average daily incidence of covid on the the number of reported cases as specified in the base model. We regress the average daily incidence of covid on these fitted values in addition to the county covariates.
+## County health rankings and variable selection
 
-We include the predicted values from the Google survey data to examine what additional county covariates are significant in explaining the remaining variation.
+[CountyHealthRankings.org](https://www.countyhealthrankings.org/)
+contains county-level data for 202 health indicators.  Some of these
+indicators are available for all 3218 counties.  However, we have
+found that for most purposes 595 counties is adequate, as this
+represents about 75% of the population.
 
-### Predicting confirmed cases
+We view this as a model selection issue, and utilize a spike-and-slab
+regression.  This is a Bayesian approach the estimates the probability
+of inclusion in a regression, which makes it particularly easy to
+interpret.
 
-#### Full OLS
-
-```{r}
+```{r, label="death" }
 covar_dat <- nber_dat %>%
   inner_join(data.frame(county_name = names(goog_mdl$fitted),
                         predicted = goog_mdl$fitted),
@@ -206,19 +307,6 @@ covar_dat <- nber_dat %>%
          pct_65_and_older:year_structure_built, -pct_non_hispanic_white,
          -starts_with("uninsured_")) %>%
   select_if(~ mean(!is.na(.x)) == 1) %>% mutate_all(~ log(.x + 1))
-
-covar_mdl <- lm(jhu_csse_confirmed_incidence_num_value ~ ., covar_dat)
-
-huxreg(covar_mdl, statistics = c(N = "nobs", R2 = "r.squared"))
-```
-
-A few predictors are significant for this specification. Minority populations, Native Americans and non-Hispanic Black appears to predict higher cases, as does increased black/white residential racial segregation.  Health indicators such as physical inactivity also appear to predict higher cases. Food insecurity and driving alone to work appear to predict less cases. Driving alone to work could be suggestive of the role crowded, public transit plays in disease spread.  Food insecurity could be a measure of poverty and depressed economic activity which could also limit disease spread. Greater flu vaccinations also predict higher cases which may suggest a population that is more open or accessible to disease testing facilities.
-
-#### Spike-slab
-
-Now do variable selection with spike-slab.
-
-```{r}
 ss_mdl <- lm.spike(jhu_csse_confirmed_incidence_num_value ~ .,
                    niter = spike_slab_iter,
                    data = covar_dat)
@@ -231,15 +319,15 @@ ss_mdl %>% plot("inclusion",
                  main = paste("r-square:", round(ss_rsq, 2)))
 ```
 
-Many of the same predictors are picked up by spike and slab.
+We also ran a kitchen-sink regression with all 202 predictors and
+identified those with large t-statistics (the "three-star variables").
+Both approaches identified the same predictors.  Of course, no causal
+interpretation should be given to these findings.
 
 ### Predicting deaths
 
-We repeat the same analysis above but now trying to predict deaths.
-
-#### Full OLS
-
-We do regular OLS with all county covariates and the confirmed case predictions from the Google survey data.
+Here we repeat the estimation described above but we use deaths as the
+depending variable.
 
 ```{r}
 covar_dat <- nber_dat %>%
@@ -250,17 +338,7 @@ covar_dat <- nber_dat %>%
          pct_65_and_older:year_structure_built, -pct_non_hispanic_white,
          -starts_with("uninsured_")) %>%
   select_if(~ mean(!is.na(.x)) == 1) %>% mutate_all(~ log(.x + 1))
-
-covar_mdl <- lm(jhu_csse_deaths_incidence_num_value ~ ., covar_dat)
-
-huxreg(covar_mdl, statistics = c(N = "nobs", R2 = "r.squared"))
 ```
-
-A few predictors are significant for this specification. Native American populations appears to predict higher cases while higher proportions of Asians predict lower cases.  Health indicators such as physical inactivity also appear to predict higher cases. Food insecurity and driving alone to work appear to predict less cases. Driving alone to work could be suggestive of the role crowded, public transit plays in disease spread.  Food insecurity could be a measure of poverty and depressed economic activity which could also limit disease spread.
-
-#### Spike-slab
-
-Now do variable selection with spike-slab.
 
 ```{r}
 ss_mdl <- lm.spike(jhu_csse_deaths_incidence_num_value ~ .,
@@ -275,116 +353,36 @@ ss_mdl %>% plot("inclusion",
                  main = paste("r-square:", round(ss_rsq, 2)))
 ```
 
-Many of the same predictors are shown but with more indicators related to health. Income inequality and racial segregation predict higher cases. Driving alone to work and food insecurity continue to predict fewer cases. Asian populations continue to predict lower case numbers.
+## Comparison to other covariate studies
 
-## Comparison to Knittel and Ozaltun and Wu, et al
+[Knittel and Ozaltun, 2020](https://www.nber.org/papers/w27391.pdf)
+use a similar set of correlates from the American Community Survey
+(ACS) to examine predictors of deaths.  They find higher shares of
+African American residents correlate with higher deaths per capita
+across states, but not within states. A similar effect is seen for the
+elderly. Higher amounts of public transport and driving to work
+relative to telecommuting predict higher deaths. Higher share of
+people not working, home values, higher summer temperatures, and lower
+winter temperatures are also correlated with higher death rates.
 
-[Knittel and Ozaltun, 2020](https://www.nber.org/papers/w27391.pdf) use a similar set of correlates from the American Communit Survey (ACS) with deaths that does not use a a measure of infection. They find higher shares of African American residents correlate with higher deaths per capita across states, but not within states. A similar effect is seen with the elderly. Higher amounts of public transport and driving into work relative to telecommuting predict higher deaths. Higher share of people nto working, home values, higher summer temperatures, and lower winter temperatures also have higher death rates.
+Unlike [Wu, et al
+2020](https://www.medrxiv.org/content/10.1101/2020.04.05.20054502v2)
+they do not find air pollution as a factor. Furthermore they do not
+find that obesity, number of ICU beds per capita, or poverty rates
+are important covariates.
 
-Unlike [Wu, et al 2020](https://www.medrxiv.org/content/10.1101/2020.04.05.20054502v2) they do not find air pollution as a factor. Futhermore they do not find that obsesity, number of ICU beds per capita, or poverty rates.
+Our results are not directly comparable to these studies because we
+control for the number of surveyed infections from the Google
+survey. This allows us to examine the predictors of deaths while
+controlling for infection rates.  This surfaces a slightly different
+set of predictors that include positive drivers of deaths: racial
+segregation, population, physical inactivity, and income inequality.
+The negative drivers of deaths include: food insecurity, driving alone
+to work, a greater share of Asians, and poor or fair health.
 
-![regression table](knittel_ozaltun.png)
+This suggests that areas with a sufficient amount of income equality
+and racial segregation seem to drive more deaths while areas that are
+more impoverished overall drive less deaths.  Driving alone to work
+suggests that commuting plays a major role in COVID mortality.
 
-Our results are not directly comparable because we control for the number of surveyed infections from the Google survey. This allows us to examine the predictors of deaths controlling for infection rates.  This surfaces a slightly different set of predictors that include positive drivers of deaths: racial segregation, population, physical inactivity, and income inequality.  The negative drivers of deaths include: food insecurity, driving alone to work, a greater share of Asians, and poor or fair health.
-
-This suggests that areas with a sufficient amount of income equality and racial segregation seem to drive more deaths whille areas that are more inpoverished overall drive less deaths.  Driving alone to work suggests that commuting plays a major role in COVID mortality.
-
-
-## Appendix
-
-### Using 595 counties is fine.
-
-The Facebook and Google surveys cover less than 20% of
-counties. However if we look at the covered population of these
-counties we find that, by population, these counties cover more
-than 75% of the population in the US.
-
-```{r}
-nber_dat %>%
-  select(population, contains("survey") & ends_with("_value")) %>%
-  gather(metric, value, -population) %>%
-  group_by(metric) %>%
-  summarise(`covered counties` = mean(!is.na(value))) %>%
-  mutate_at(vars(metric), ~ str_remove(.x, "_value")) %>%
-  ggplot(aes(metric, `covered counties`)) + geom_col() + coord_flip() +
-  ylim(0, 1) +
-  xlab(element_blank())
-```
-
-The Facebook and Google surveys cover less than 20% of counties. However if we look at the covered population of these counties we find that, by population, these counties cover more than 75% of the population in the US.
-
-```{r}
-nber_dat %>%
-  select(population, contains("survey") & ends_with("_value")) %>%
-  gather(metric, value, -population) %>%
-  filter(!is.nan(population)) %>%
-  group_by(metric) %>%
-  summarise(
-    `covered population` = sum(population[!is.nan(value)]) / sum(population)) %>%
-  mutate_at(vars(metric), ~ str_remove(.x, "_value")) %>%
-  ggplot(aes(metric, `covered population`)) + geom_col() + coord_flip() +
-  ylim(0, 1) + 
-  xlab(element_blank())
-```
-
-### Random forest
-
-#### Cases
-
-Not sure if RF is useful here:
-
-```{r}
-ranger_mdl <- ranger(jhu_csse_confirmed_incidence_num_value ~ .,
-                     data = covar_dat, importance = "impurity")
-
-ranger_mdl %>% importance() %>%
-  tibble(var = names(.), importance = .) %>%
-  top_n(9, importance) %>%
-  mutate(var = fct_reorder(var, importance)) %>%
-  ggplot(aes(var, importance)) + geom_bar(stat = "identity") +
-  coord_flip() + xlab(element_blank()) +
-  ggtitle(paste("r-square:", round(ranger_mdl$r.squared, 2))) +
-  theme_minimal()
-```
-
-Partial dependance plots for these variables are shown below:
-
-```{r fig.height=8}
-top_vars <- importance(ranger_mdl) %>% sort %>% tail(9) %>% rev() %>% names()
-pdps <- lapply(top_vars, FUN = function(x) {
-  ranger_mdl %>%
-    pdp::partial(pred.var = x, train = covar_dat) %>%
-    pdp::plotPartial()
-})
-do.call(gridExtra::grid.arrange, c(pdps, ncol=3))
-```
-
-#### Deaths
-
-Not sure if RF is useful here:
-
-```{r}
-ranger_mdl <- ranger(jhu_csse_deaths_incidence_num_value ~ .,
-                     data = covar_dat, importance = "impurity")
-
-ranger_mdl %>% importance() %>%
-  tibble(var = names(.), importance = .) %>%
-  top_n(9, importance) %>%
-  mutate(var = fct_reorder(var, importance)) %>%
-  ggplot(aes(var, importance)) + geom_bar(stat = "identity") +
-  coord_flip() + xlab(element_blank()) +
-  ggtitle(paste("r-square:", round(ranger_mdl$r.squared, 2))) +
-  theme_minimal()
-```
-
-Partial dependance plots for these variables are shown below:
-
-```{r fig.height=8}
-top_vars <- importance(ranger_mdl) %>% sort %>% tail(9) %>% rev() %>% names()
-pdps <- lapply(top_vars, FUN = function(x) {
-  ranger_mdl %>%
-    pdp::partial(pred.var = x, train = covar_dat) %>%
-    pdp::plotPartial()
-})
-do.call(gridExtra::grid.arrange, c(pdps, ncol=3))
-```
+## Time series
