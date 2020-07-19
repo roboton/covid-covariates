@@ -1,5 +1,5 @@
 ---
-title: "Detecting covid-19 cases using machine learning"
+title: "Surveying the pandemic"
 subtitle: "County Timeseries"
 author: "Hal Varian, Robert On"
 date: "`r format(Sys.time(), '%d %B, %Y')`"
@@ -50,7 +50,7 @@ covid_ts <- covidcast %>%
 
 ```{r}
 fcst <- covid_ts %>% filter(date < "2020-04-01") %>%
-  fill(jhu_csse_confirmed_cumulative_num_value, .direction = "down") %>%
+  fill(jhu_csse_confirmed_incidence_num_value, .direction = "down") %>%
   select(jhu_csse_confirmed_incidence_num_value) %>%
   filter(county_name %in% c("New York County, NY",
                             "Essex County, NJ",
@@ -187,6 +187,8 @@ fcst_fe_14day_fb_hh <- fcst_dat %>%
      data = .)
 ```
 
+No county fixed effects:
+
 ```{r}
 huxtable::huxreg("3day_gg" = fcst_3day_gg, "7day_gg" = fcst_7day_gg,
                  #"14day_gg" = fcst_14day_gg,
@@ -194,8 +196,18 @@ huxtable::huxreg("3day_gg" = fcst_3day_gg, "7day_gg" = fcst_7day_gg,
                  #"14day_fb" = fcst_14day_fb,
                  "3day_fb_hh" = fcst_3day_fb_hh, "7day_fb_hh" = fcst_7day_fb_hh,
                  #"14day_fb_hh" = fcst_14day_fb_hh,
-                 
-                 "3day_fe_gg" = fcst_fe_3day_gg, "7day_fe_gg" = fcst_fe_7day_gg,
+                
+                 coefs = c(fb_hh = "fb_survey_smoothed_cli_value",
+                           #fb_cmnty_hh = "fb_survey_smoothed_hh_cmnty_cli_value",
+                           fb_cmnty = "fb_survey_smoothed_nohh_cmnty_cli_value",
+                           goog_cmnty = "google_survey_smoothed_cli_value"),
+                 statistics = c(N = "nobs", R2 = "r.squared"))
+```
+
+With county fixed effects:
+
+```{r}
+huxtable::huxreg("3day_fe_gg" = fcst_fe_3day_gg, "7day_fe_gg" = fcst_fe_7day_gg,
                  #"14day_fe_gg" = fcst_fe_14day_gg,
                  "3day_fe_fb" = fcst_fe_3day_fb, "7day_fe_fb" = fcst_fe_7day_fb,
                  #"14day_fe_fb" = fcst_fe_14day_fb,
