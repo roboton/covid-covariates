@@ -1,6 +1,6 @@
 ---
 title: "Surveying the pandemic"
-subtitle: "County Timeseries"
+subtitle: "Forecast edition"
 author: "Hal Varian, Robert On"
 date: "`r format(Sys.time(), '%d %B, %Y')`"
 output:
@@ -12,6 +12,9 @@ output:
     toc: yes
     df_print: paged
 ---
+
+# Set up
+
 ```{r global_options, include=FALSE}
 knitr::opts_chunk$set(echo=FALSE, warning=FALSE, message=FALSE)
 ```
@@ -25,20 +28,271 @@ library(fable)
 library(bsts)
 # general data manipulation
 library(tidyverse)
+library(lfe)
 ```
 
-# Forecasting
-
-## Univariate forecast
+Download/load timeseries data
 
 ```{r}
-covidcast_chr <- read_csv("https://ond3.com/covdata/covidcast_chr.csv",
-                         col_types = cols(
-                           geo_type = "c", geo_value = "c", date = "D",
-                           county_name = "c", state_name = "c", state_abb = "c",
-                           geocode = "c", subregion1_code = "c",
-                           .default = col_number()))
+local_file <- "covidcast_chr.csv"
+
+if (!file.exists(local_file)) {
+  download.file("https://ond3.com/covdata/covidcast_chr.csv",
+                destfile = local_file)
+}
+
+covidcast_chr <- read_csv(local_file,
+                          col_types = cols(
+                            geo_type = "c", geo_value = "c", date = "D",
+                            county_name = "c", state_name = "c", state_abb = "c",
+                            geocode = "c", subregion1_code = "c",
+                            .default = col_number()))
 ```
+
+## Survey and case timeseries data
+
+We have time series data for over 1000 counties in the US. We focus on:
+- Seven day rolling average of daily confirmed incidence of COVID-19 (response)
+- Google Covid-like Illness (CLI) survey (community only)
+- Facebook CLI survey (individual only)
+- Facebook CLI survey (community only)
+- Facebook CLI survey (community + household)
+
+Not all counties report have surveys, and not all counties have confirmed COVID-19 cases:
+
+```{r}
+covidcast_chr %>%
+  select(date, county_name,
+         matches("^jhu_csse_confirmed_.*incidence.*"),
+         matches("^.*survey_smoothed_.*cli_(value|sample_size)")) %>%
+  gather(predictor, value, -date, -county_name) %>%
+  group_by(predictor) %>%
+  summarise(min_date = min(date[!is.na(value)]),
+            max_date = max(date[!is.na(value)]),
+            num_dates = length(date[!is.na(value)]),
+            num_counties = length(unique(county_name[!is.na(value)])))
+```
+
+The Facebook data has the greatest spread of dates and counties.  Since the Google survey's only ran for a month, there aren't as many dates or counties.
+
+Here we visualize a few of these survey and case count indicators over time and place (SF Bay Area):
+
+```{r fig.height = 8, fig.width = 8}
+covidcast_chr %>%
+  select(date, county_name,
+         starts_with("jhu_csse_confirmed_7dav_incidence_num_value"),
+         starts_with("jhu_csse_confirmed_incidence_num_value"),
+         matches("^.*survey_smoothed_.*cli_value")) %>%
+  rename_all(~ str_remove(.x, '_survey_smoothed')) %>%
+  rename_all(~ str_remove(.x, '_cli_value')) %>%
+  gather(metric, value, -date, -county_name) %>%
+  filter(date > "2020-03-01") %>%
+  filter(county_name %in% c(
+    "Santa Clara County", "Contra Costa County", "Alameda County",
+    "San Mateo County", "San Francisco County")) %>%
+  ggplot((aes(date, value, color = metric))) + geom_line() +
+  facet_grid(metric ~ county_name, scales = "free_y") +
+  theme(legend.position = "none")
+```
+
+## Survey predictive power
+
+We begin with a basic model where survey symptoms predict cases $k$ days into the future. For county $c$ and time $t$ with the given prediction interval days, $k$:
+
+$$cases_{c,t}/pop_c = \beta_0 * \frac{yes_{c,t-k}}{(yes_{c,t-k} + no_{c,t-k})}$$
+Taking logs:
+
+$$log(cases_{c,t}) - log(pop_c) = log(\beta_0) + log(yes_{c,t-k}) - log(yes_{c,t-k} + no_{c,t-k})$$
+
+So we will estimate:
+
+$$log(cases_{c,t})  = log(\beta_0) + \beta_1*log(pop_c) + \beta_2*log(yes_{c,t-k}) - \beta_3*log(yes_{c,t-k} + no_{c,t-k})$$
+
+for $k=0,7,14$.
+
+Furthermore we can include county fixed effects which would de-mean the response and predictors for each county - leaving only the variation in time.
+
+The specification that includes county-level fixed effects:
+
+$$log(cases_{c,t})  = log(\beta_0) + \beta_2*log(yes_{c,t-k}) - \beta_3*log(yes_{c,t-k} + no_{c,t-k}) + \beta_4I(county\_name = c)$$
+In this case county population is no longer relevant as it would be absorbed into the county fixed effect.
+
+```{r}
+fcst_dat <- covidcast_chr %>%
+  select(date, county_name, state_abb, population,
+         starts_with("jhu_csse_confirmed_7dav_incidence_num_value"),
+         starts_with("jhu_csse_confirmed_incidence_num_value"),
+         matches("^.*survey_smoothed.*_cli_(value|sample_size)")) %>%
+  filter(complete.cases(.)) %>%
+  mutate(county_name = paste(county_name, state_abb, sep = ", ")) %>%
+  mutate_if(is.numeric, ~ if_else(.x < 0, 0, .x))
+
+mdl_dat <- fcst_dat %>%
+  mutate(across(contains("survey"), list(lag7 = ~ lead(.x, 7),
+                                         lag14 = ~ lead(.x, 14)))) %>%
+  pivot_longer(contains("survey"),
+               names_to = c("survey_type", "survey_metric", "lag"),
+               names_pattern = "^(.*)_cli_(value|sample_size)_?(lag.*)?$") %>%
+  pivot_wider(names_from = survey_metric, values_from = value) %>%
+  mutate(lag = replace_na(lag, "lag0")) %>%
+  rename(cases = jhu_csse_confirmed_7dav_incidence_num_value) %>%
+  group_by(survey_type, lag) %>%
+  nest() %>% rowwise() %>%
+  mutate(
+    # only_cnty_fe = list(lm(log(cases + 1) ~ county_name, data = data)),
+    # only_state_fe = list(lm(log(cases + 1) ~ state_abb, data = data)),
+    # only_cnty_pop = list(lm(log(cases + 1) ~ log(population + 1), data = data)),
+    no_fe = list(felm(log(cases + 1) ~ log(population + 1) + log(value + 1) +
+         log(sample_size + 1), data = data)),
+    cnty_fe = list(felm(log(cases + 1) ~ log(value + 1) +
+                            log(sample_size + 1) | county_name, data = data)) #,
+    # state_fe = list(felm(log(cases + 1) ~ log(population + 1) + log(value + 1) +
+    #                          log(sample_size + 1) | state_abb, data = data))
+    ) %>%
+  pivot_longer(c(no_fe, cnty_fe, #state_fe,
+                 #only_cnty_fe, only_state_fe, only_cnty_pop
+                 ),
+               names_to = "model_type", values_to = "mdl") %>%
+  arrange(lag, survey_type, model_type) %>%
+  mutate(survey_type = str_replace(survey_type, "_smoothed", ""),
+         mdl_name = paste(survey_type, lag, model_type),
+         proj.adj.r2 = sapply(mdl, FUN = function(x) { summary(x)$P.adj.r.squared }),
+         total.adj.r2 = sapply(mdl, FUN = function(x) { summary(x)$adj.r.squared }))
+```
+
+After running the specifiction with and without county fixed effects, we estimate $R^2$ for each survey and lag (0, 7, 14 days).
+
+```{r}
+mdl_dat %>% select(-mdl, -mdl_name, -data) %>%
+  pivot_wider(names_from = model_type,
+              values_from = c(proj.adj.r2, total.adj.r2)) %>%
+  arrange(-proj.adj.r2_cnty_fe)
+```
+
+Projected $R^2$ help us estimate the added predictive power of our predictors while ignoring variation across counties. Here we see that the added predictive power (over time) is very small for the Google surveys but the other survey types don't add anything at all according to projected $R^2$. As one might expect, increasing the step-ahead predictors to 7 and 14 days diminishes thie predictive power even further.
+
+```{r}
+lag0_mdl <- mdl_dat %>% filter(lag == "lag0", model_type == "cnty_fe")
+huxtable::huxreg(
+  setNames(lag0_mdl$mdl, lag0_mdl$mdl_name),
+  #coefs = c("log(population + 1)", "log(value + 1)", "log(sample_size + 1)"),
+  statistics = c("R2" = "r.squared", "N" = "nobs")) %>%
+  huxtable::insert_row(
+    c("Proj R2", lag0_mdl$proj.adj.r2), after = 6)
+```
+
+Correspondingly there's a larger coefficient for the values from the Google survey compared to those from FB.
+
+
+## Distribution of county parameters
+
+```{r}
+cnty_dat <- fcst_dat %>%
+  mutate(across(contains("survey"), list(lag7 = ~ lead(.x, 7),
+                                         lag14 = ~ lead(.x, 14)))) %>%
+  pivot_longer(contains("survey"),
+               names_to = c("survey_type", "survey_metric", "lag"),
+               names_pattern = "^(.*)_cli_(value|sample_size)_?(lag.*)?$") %>%
+  pivot_wider(names_from = survey_metric, values_from = value) %>%
+  mutate(lag = replace_na(lag, "lag0")) %>%
+  select(
+    date, county_name, population,
+    survey_type, lag, sample_size, value,
+    cases = jhu_csse_confirmed_7dav_incidence_num_value)
+
+cnty_mdl <- cnty_dat %>%
+  group_by(county_name, survey_type, lag) %>%
+  nest() %>% rowwise() %>%
+  mutate(
+    mdl = list(lm(log(cases + 1) ~ log(value + 1) + log(sample_size + 1),
+                  data = data))) %>%
+  ungroup() %>%
+  mutate(adj.r2 = sapply(mdl, FUN = function(x) { summary(x)$adj.r.squared }),
+         nobs = sapply(mdl, FUN = function(x) nrow(x$model)),
+         value_coef = sapply(
+           mdl, FUN = function(x) { coef(x)[["log(value + 1)"]]})) %>%
+  filter(!is.na(value_coef)) %>%
+  mutate(value_pval = sapply(mdl, FUN = function(x) {
+    summary(x)$coefficients["log(value + 1)", "Pr(>|t|)"] }))
+```
+
+```{r}
+cnty_mdl %>% select(-data, -mdl) %>%
+  arrange(-adj.r2) %>%
+  filter(value_pval < 0.001)
+```
+
+We find in some counties, the survey results are very strong predictors:
+
+```{r fig.height=8, fig.width=8}
+covidcast_chr %>%
+  mutate(county_name = paste(county_name, state_abb, sep = ", ")) %>%
+  select(date, county_name,
+         starts_with("jhu_csse_confirmed_7dav_incidence_num_value"),
+         starts_with("jhu_csse_confirmed_incidence_num_value"),
+         matches("^.*survey_smoothed_.*cli_value")) %>%
+  rename_all(~ str_remove(.x, '_survey_smoothed')) %>%
+  rename_all(~ str_remove(.x, '_cli_value')) %>%
+  gather(metric, value, -date, -county_name) %>%
+  filter(date > "2020-03-01") %>%
+  filter(county_name %in% c(
+    "Westchester County, NY", "Essex County, NJ")) %>%
+  ggplot((aes(date, value, color = metric))) + geom_line() +
+  facet_grid(metric ~ county_name, scales = "free") +
+  theme(legend.position = "none")
+```
+
+```{r fig.height=8, fig.width=8}
+covidcast_chr %>%
+  mutate(county_name = paste(county_name, state_abb, sep = ", ")) %>%
+  select(date, county_name,
+         starts_with("jhu_csse_confirmed_7dav_incidence_num_value"),
+         starts_with("jhu_csse_confirmed_incidence_num_value"),
+         matches("^.*survey_smoothed_.*cli_value")) %>%
+  rename_all(~ str_remove(.x, '_survey_smoothed')) %>%
+  rename_all(~ str_remove(.x, '_cli_value')) %>%
+  gather(metric, value, -date, -county_name) %>%
+  filter(date > "2020-03-01") %>%
+  filter(county_name %in% c(
+    "Sacramento County, CA", "Harnett County, NC")) %>%
+  ggplot((aes(date, value, color = metric))) + geom_line() +
+  facet_grid(metric ~ county_name, scales = "free") +
+  theme(legend.position = "none")
+```
+
+### Google surveys
+
+```{r fig.width=8, fig.height=8}
+cnty_mdl %>%
+  filter(str_detect(survey_type, "google")) %>%
+  pivot_longer(c(adj.r2, value_coef, nobs, value_pval)) %>%
+  ggplot(aes(value)) + geom_histogram() + facet_wrap(lag ~ name, scales = "free")
+```
+
+### Facebook surveys
+
+```{r fig.width=8, fig.height=8}
+cnty_mdl %>%
+  filter(str_detect(survey_type, "fb_")) %>%
+  pivot_longer(c(adj.r2, value_coef, nobs, value_pval)) %>%
+  ggplot(aes(value)) + geom_histogram() + facet_wrap(lag ~ name, scales = "free")
+```
+
+## Timeseries cross-validation
+
+```{r}
+one_county <- cnty_dat %>%
+  filter(county_name == "Essex County, NJ")
+
+e <- tsCV(one_county$cases, rwf, xreg = one_county$value, drift=TRUE, h=7)
+
+sqrt(mean(e^2, na.rm=TRUE))
+sqrt(mean(residuals(rwf(one_county$cases, drift=TRUE))^2, na.rm=TRUE))
+```
+
+## Appendix
+
+### Univariate forecast
 
 ```{r}
 covid_ts <- covidcast %>%
@@ -67,155 +321,4 @@ fcst %>% accuracy(covid_ts) %>% arrange(county_name, RMSE)
 
 fcst %>%
   fabletools::autoplot(covid_ts %>% filter(date > "2020-03-01"), level = 95)
-```
-
-### Univariate predictive
-
-```{r fig.height = 10}
-covidcast_chr %>%
-  select(date, county_name,
-         starts_with("jhu_csse_confirmed_7dav_incidence_num_value"),
-         matches("^.*survey_smoothed_.*cli_value")) %>%
-  gather(metric, value, -date, -county_name) %>%
-  filter(date > "2020-03-01") %>%
-  filter(county_name %in% c(
-    "Santa Clara County", "Contra Costa County", "Alameda County",
-    "San Mateo County", "San Francisco County")) %>%
-  ggplot((aes(date, value, color = metric))) + geom_line() +
-  facet_grid(metric ~ county_name, scales = "free_y") +
-  theme(legend.position = "none")
-```
-
-```{r}
-fcst_dat <- covidcast_chr %>%
-  select(date, county_name,
-         starts_with("jhu_csse_confirmed_7dav_incidence_num_value"),
-         matches("^.*survey_smoothed.*_cli_value")) %>%
-  filter(complete.cases(.)) %>%
-  group_by(county_name) %>%
-  arrange(date)
-
-fcst_3day_gg <- fcst_dat %>%
-  mutate_at(vars(contains("survey")), ~ lead(.x, 3)) %>%
-  lm(jhu_csse_confirmed_7dav_incidence_num_value ~  google_survey_smoothed_cli_value,
-     data = .)
-
-fcst_7day_gg <- fcst_dat %>%
-  mutate_at(vars(contains("survey")), ~ lag(.x, 7)) %>%
-  lm(jhu_csse_confirmed_7dav_incidence_num_value ~ google_survey_smoothed_cli_value,
-     data = .)
-
-fcst_14day_gg <- fcst_dat %>%
-  mutate_at(vars(contains("survey")), ~ lag(.x, 14)) %>%
-  lm(jhu_csse_confirmed_7dav_incidence_num_value ~ google_survey_smoothed_cli_value,
-     data = .)
-
-fcst_3day_fb <- fcst_dat %>%
-  mutate_at(vars(contains("survey")), ~ lag(.x, 3)) %>%
-  lm(jhu_csse_confirmed_7dav_incidence_num_value ~  fb_survey_smoothed_nohh_cmnty_cli_value,
-     data = .)
-
-fcst_7day_fb <- fcst_dat %>%
-  mutate_at(vars(contains("survey")), ~ lag(.x, 7)) %>%
-  lm(jhu_csse_confirmed_7dav_incidence_num_value ~ fb_survey_smoothed_nohh_cmnty_cli_value,
-     data = .)
-
-fcst_14day_fb <- fcst_dat %>%
-  mutate_at(vars(contains("survey")), ~ lag(.x, 14)) %>%
-  lm(jhu_csse_confirmed_7dav_incidence_num_value ~ fb_survey_smoothed_nohh_cmnty_cli_value,
-     data = .)
-
-fcst_3day_fb_hh <- fcst_dat %>%
-  mutate_at(vars(contains("survey")), ~ lag(.x, 3)) %>%
-  lm(jhu_csse_confirmed_7dav_incidence_num_value ~  fb_survey_smoothed_cli_value,
-     data = .)
-
-fcst_7day_fb_hh <- fcst_dat %>%
-  mutate_at(vars(contains("survey")), ~ lag(.x, 7)) %>%
-  lm(jhu_csse_confirmed_7dav_incidence_num_value ~ fb_survey_smoothed_cli_value + county_name,
-     data = .)
-
-fcst_14day_fb_hh <- fcst_dat %>%
-  mutate_at(vars(contains("survey")), ~ lag(.x, 14)) %>%
-  lm(jhu_csse_confirmed_7dav_incidence_num_value ~ fb_survey_smoothed_cli_value + county_name,
-     data = .)
-
-
-fcst_fe_3day_gg <- fcst_dat %>%
-  mutate_at(vars(contains("survey")), ~ lead(.x, 3)) %>%
-  lm(jhu_csse_confirmed_7dav_incidence_num_value ~  google_survey_smoothed_cli_value + county_name,
-     data = .)
-
-fcst_fe_7day_gg <- fcst_dat %>%
-  mutate_at(vars(contains("survey")), ~ lag(.x, 7)) %>%
-  lm(jhu_csse_confirmed_7dav_incidence_num_value ~ google_survey_smoothed_cli_value + county_name,
-     data = .)
-
-fcst_fe_14day_gg <- fcst_dat %>%
-  mutate_at(vars(contains("survey")), ~ lag(.x, 14)) %>%
-  lm(jhu_csse_confirmed_7dav_incidence_num_value ~ google_survey_smoothed_cli_value + county_name,
-     data = .)
-
-fcst_fe_3day_fb <- fcst_dat %>%
-  mutate_at(vars(contains("survey")), ~ lag(.x, 3)) %>%
-  lm(jhu_csse_confirmed_7dav_incidence_num_value ~  fb_survey_smoothed_nohh_cmnty_cli_value + county_name,
-     data = .)
-
-fcst_fe_7day_fb <- fcst_dat %>%
-  mutate_at(vars(contains("survey")), ~ lag(.x, 7)) %>%
-  lm(jhu_csse_confirmed_7dav_incidence_num_value ~ fb_survey_smoothed_nohh_cmnty_cli_value + county_name,
-     data = .)
-
-fcst_fe_14day_fb <- fcst_dat %>%
-  mutate_at(vars(contains("survey")), ~ lag(.x, 14)) %>%
-  lm(jhu_csse_confirmed_7dav_incidence_num_value ~ fb_survey_smoothed_nohh_cmnty_cli_value + county_name,
-     data = .)
-
-fcst_fe_3day_fb_hh <- fcst_dat %>%
-  mutate_at(vars(contains("survey")), ~ lag(.x, 3)) %>%
-  lm(jhu_csse_confirmed_7dav_incidence_num_value ~  fb_survey_smoothed_cli_value + county_name,
-     data = .)
-
-fcst_fe_7day_fb_hh <- fcst_dat %>%
-  mutate_at(vars(contains("survey")), ~ lag(.x, 7)) %>%
-  lm(jhu_csse_confirmed_7dav_incidence_num_value ~ fb_survey_smoothed_cli_value + county_name,
-     data = .)
-
-fcst_fe_14day_fb_hh <- fcst_dat %>%
-  mutate_at(vars(contains("survey")), ~ lag(.x, 14)) %>%
-  lm(jhu_csse_confirmed_7dav_incidence_num_value ~ fb_survey_smoothed_cli_value + county_name,
-     data = .)
-```
-
-No county fixed effects:
-
-```{r}
-huxtable::huxreg("3day_gg" = fcst_3day_gg, "7day_gg" = fcst_7day_gg,
-                 #"14day_gg" = fcst_14day_gg,
-                 "3day_fb" = fcst_3day_fb, "7day_fb" = fcst_7day_fb,
-                 #"14day_fb" = fcst_14day_fb,
-                 "3day_fb_hh" = fcst_3day_fb_hh, "7day_fb_hh" = fcst_7day_fb_hh,
-                 #"14day_fb_hh" = fcst_14day_fb_hh,
-                
-                 coefs = c(fb_hh = "fb_survey_smoothed_cli_value",
-                           #fb_cmnty_hh = "fb_survey_smoothed_hh_cmnty_cli_value",
-                           fb_cmnty = "fb_survey_smoothed_nohh_cmnty_cli_value",
-                           goog_cmnty = "google_survey_smoothed_cli_value"),
-                 statistics = c(N = "nobs", R2 = "r.squared"))
-```
-
-With county fixed effects:
-
-```{r}
-huxtable::huxreg("3day_fe_gg" = fcst_fe_3day_gg, "7day_fe_gg" = fcst_fe_7day_gg,
-                 #"14day_fe_gg" = fcst_fe_14day_gg,
-                 "3day_fe_fb" = fcst_fe_3day_fb, "7day_fe_fb" = fcst_fe_7day_fb,
-                 #"14day_fe_fb" = fcst_fe_14day_fb,
-                 "3day_fe_fb_hh" = fcst_fe_3day_fb_hh, "7day_fe_fb_hh" = fcst_fe_7day_fb_hh,
-                 #"14day_fe_fb_hh" = fcst_fe_14day_fb_hh,
-                 coefs = c(fb_hh = "fb_survey_smoothed_cli_value",
-                           #fb_cmnty_hh = "fb_survey_smoothed_hh_cmnty_cli_value",
-                           fb_cmnty = "fb_survey_smoothed_nohh_cmnty_cli_value",
-                           goog_cmnty = "google_survey_smoothed_cli_value"),
-                 statistics = c(N = "nobs", R2 = "r.squared"))
 ```
