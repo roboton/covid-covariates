@@ -281,6 +281,7 @@ cnty_mdl %>%
 ## Timeseries cross-validation
 
 ```{r}
+library(forecast)
 one_county <- cnty_dat %>%
   filter(county_name == "Essex County, NJ")
 
@@ -288,37 +289,4 @@ e <- tsCV(one_county$cases, rwf, xreg = one_county$value, drift=TRUE, h=7)
 
 sqrt(mean(e^2, na.rm=TRUE))
 sqrt(mean(residuals(rwf(one_county$cases, drift=TRUE))^2, na.rm=TRUE))
-```
-
-## Appendix
-
-### Univariate forecast
-
-```{r}
-covid_ts <- covidcast %>%
-  filter(geo_type == "county") %>%
-  mutate(county_name = paste(county_name, state_abb, sep = ", ")) %>%
-  select(-geo_type, -geo_value, -state_name, -state_abb, -geocode) %>%
-  as_tsibble(key = county_name, index = date)
-```
-
-```{r}
-fcst <- covid_ts %>% filter(date < "2020-04-01") %>%
-  fill(jhu_csse_confirmed_incidence_num_value, .direction = "down") %>%
-  select(jhu_csse_confirmed_incidence_num_value) %>%
-  filter(county_name %in% c("New York County, NY",
-                            "Essex County, NJ",
-                            "Wayne County, MI",
-                            "Santa Clara County, CA")) %>%
-  model(
-    ets = ETS(jhu_csse_confirmed_incidence_num_value),
-    arima = ARIMA(jhu_csse_confirmed_incidence_num_value),
-    rw = RW(jhu_csse_confirmed_incidence_num_value)
-  ) %>%
-  forecast(h = "1 week")
-
-fcst %>% accuracy(covid_ts) %>% arrange(county_name, RMSE)
-
-fcst %>%
-  fabletools::autoplot(covid_ts %>% filter(date > "2020-03-01"), level = 95)
 ```
